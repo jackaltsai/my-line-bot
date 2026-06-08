@@ -9,7 +9,14 @@
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1
-  }
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "REPLACE_WITH_SHARED_DATABASE_NAME",
+      "database_id": "REPLACE_WITH_SHARED_DATABASE_ID"
+    }
+  ]
   // "vars": {
   //   "MY_VAR": "my-variable"
   // },
