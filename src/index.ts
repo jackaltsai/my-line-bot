@@ -98,7 +98,12 @@ async function submitRunPodJob(userId: string, text: string, origin: string, env
       'Authorization': `Bearer ${env.RUNPOD_API_KEY}`,
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify({ input: { userId, text }, webhook: callbackUrl.toString() })
+    body: JSON.stringify({
+      input: {
+        messages: [{ role: 'user', content: text }]
+      },
+      webhook: callbackUrl.toString()
+    })
   });
 
   if (!response.ok) {
