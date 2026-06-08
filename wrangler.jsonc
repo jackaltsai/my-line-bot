@@ -2,10 +2,20 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "my-line-bot",
   "main": "src/index.ts",
-  "compatibility_date": "2026-06-08"
-  // "compatibility_flags": [
-  //   "nodejs_compat"
-  // ],
+  "compatibility_date": "2026-06-08",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "kv_namespaces": [
+    {
+      "binding": "SUBSCRIPTIONS",
+      "id": "d436a6061a564700a15549af70984795"
+    }
+  ]
   // "vars": {
   //   "MY_VAR": "my-variable"
   // },
