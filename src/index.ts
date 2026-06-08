@@ -67,8 +67,12 @@ app.post('/runpod-callback', async (c) => {
     return c.text('Invalid body', 400);
   }
 
-  // 根據 RunPod 的回呼結構調整
-  const aiReply = payload.output?.message || '我現在沒辦法思考';
+  // RAW_OPENAI_OUTPUT=true -> RunPod 回傳 OpenAI Chat Completion 格式
+  const aiReply =
+    payload.output?.choices?.[0]?.message?.content ||
+    payload.output?.choices?.[0]?.tokens?.[0] ||
+    payload.output?.message ||
+    '我現在沒辦法思考';
 
   try {
     await pushMessageToLine(userId, aiReply, c.env);
