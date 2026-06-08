@@ -6,11 +6,12 @@ type Bindings = {
   LINE_CHANNEL_ACCESS_TOKEN: string;
   RUNPOD_ENDPOINT_ID: string;
   RUNPOD_API_KEY: string;
+  RUNPOD_CALLBACK_SECRET: string;
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
 
-// 核心邏輯：收到訊息 -> 立即回應 200 -> 非同步呼叫 RunPod -> 推播回 LINE
+// 核心邏輯：收到訊息 -> 立即回應 200 -> 提交非同步 RunPod 任務 (帶 webhook 回呼) -> RunPod 完成後呼叫 /runpod-callback 推播回 LINE
 app.post('/webhook', async (c) => {
   const signature = c.req.header('x-line-signature') || '';
   const body = await c.req.text();
@@ -27,6 +28,8 @@ app.post('/webhook', async (c) => {
     return c.text('Invalid body', 400);
   }
 
+  const origin = new URL(c.req.url).origin;
+
   // 使用 Promise.all 處理多個事件，並透過 waitUntil 確保即使請求結束後任務也能繼續
   c.executionCtx.waitUntil(
     Promise.all(events.map(async (event) => {
@@ -35,13 +38,10 @@ app.post('/webhook', async (c) => {
         const text = event.message.text;
 
         try {
-          // A. 呼叫 RunPod Serverless (非同步調用 /run)
-          const aiReply = await callRunPod(userId, text, c.env);
-
-          // B. 主動推播訊息回 LINE
-          await pushMessageToLine(userId, aiReply, c.env);
+          // 提交非同步任務給 RunPod，並附上回呼網址，讓 RunPod 處理完後主動通知我們
+          await submitRunPodJob(userId, text, origin, c.env);
         } catch (err) {
-          console.error('Failed to handle message event', err);
+          console.error('Failed to submit RunPod job', err);
         }
       }
     }))
@@ -51,25 +51,53 @@ app.post('/webhook', async (c) => {
   return c.json({ status: 'success' });
 });
 
-// 呼叫 RunPod API
-async function callRunPod(userId: string, text: string, env: Bindings): Promise<string> {
-  const response = await fetch(`https://api.runpod.ai/v2/${env.RUNPOD_ENDPOINT_ID}/runsync`, {
+// RunPod 任務完成後的回呼端點
+app.post('/runpod-callback', async (c) => {
+  const userId = c.req.query('userId');
+  const secret = c.req.query('secret');
+
+  if (!userId || secret !== c.env.RUNPOD_CALLBACK_SECRET) {
+    return c.text('Unauthorized', 401);
+  }
+
+  let payload: any;
+  try {
+    payload = await c.req.json();
+  } catch {
+    return c.text('Invalid body', 400);
+  }
+
+  // 根據 RunPod 的回呼結構調整
+  const aiReply = payload.output?.message || '我現在沒辦法思考';
+
+  try {
+    await pushMessageToLine(userId, aiReply, c.env);
+  } catch (err) {
+    console.error('Failed to push message to LINE', err);
+    return c.text('Failed to push message', 500);
+  }
+
+  return c.json({ status: 'success' });
+});
+
+// 呼叫 RunPod 非同步 API (/run)，並附上 webhook 回呼網址
+async function submitRunPodJob(userId: string, text: string, origin: string, env: Bindings): Promise<void> {
+  const callbackUrl = new URL('/runpod-callback', origin);
+  callbackUrl.searchParams.set('userId', userId);
+  callbackUrl.searchParams.set('secret', env.RUNPOD_CALLBACK_SECRET);
+
+  const response = await fetch(`https://api.runpod.ai/v2/${env.RUNPOD_ENDPOINT_ID}/run`, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${env.RUNPOD_API_KEY}`,
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify({ input: { userId, text } })
+    body: JSON.stringify({ input: { userId, text }, webhook: callbackUrl.toString() })
   });
 
   if (!response.ok) {
-    console.error('RunPod request failed', response.status, await response.text());
-    return '我現在沒辦法思考';
+    console.error('RunPod job submission failed', response.status, await response.text());
   }
-
-  const data: any = await response.json();
-  // 根據 RunPod 的輸出結構調整
-  return data.output?.message || '我現在沒辦法思考';
 }
 
 // 透過 LINE Messaging API 主動推播
