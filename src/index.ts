@@ -67,6 +67,8 @@ app.post('/runpod-callback', async (c) => {
     return c.text('Invalid body', 400);
   }
 
+  console.log('RunPod callback payload:', JSON.stringify(payload));
+
   // RAW_OPENAI_OUTPUT=true -> RunPod 回傳 OpenAI Chat Completion 格式
   const aiReply =
     payload.output?.choices?.[0]?.message?.content ||
