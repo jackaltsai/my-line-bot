@@ -67,13 +67,9 @@ app.post('/runpod-callback', async (c) => {
     return c.text('Invalid body', 400);
   }
 
-  console.log('RunPod callback payload:', JSON.stringify(payload));
-
-  // RAW_OPENAI_OUTPUT=true -> RunPod 回傳 OpenAI Chat Completion 格式
-  const aiReply =
-    payload.output?.choices?.[0]?.message?.content ||
-    payload.output?.choices?.[0]?.tokens?.[0] ||
-    payload.output?.message ||
+  // vLLM worker 回傳格式: output 為陣列, output[0].choices[0].tokens[0] 為生成文字
+  const aiReply: string =
+    payload.output?.[0]?.choices?.[0]?.tokens?.[0] ||
     '我現在沒辦法思考';
 
   try {
