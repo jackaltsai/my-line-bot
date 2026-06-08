@@ -96,7 +96,10 @@ async function submitRunPodJob(userId: string, text: string, origin: string, env
     },
     body: JSON.stringify({
       input: {
-        messages: [{ role: 'user', content: text }]
+        messages: [
+          { role: 'system', content: '你是一個樂於助人的助理，請一律使用繁體中文回覆，不要使用簡體中文或其他語言。' },
+          { role: 'user', content: text }
+        ]
       },
       webhook: callbackUrl.toString()
     })
