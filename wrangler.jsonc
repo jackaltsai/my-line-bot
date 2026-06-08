@@ -10,11 +10,10 @@
     "enabled": true,
     "head_sampling_rate": 1
   },
-  "d1_databases": [
+  "kv_namespaces": [
     {
-      "binding": "DB",
-      "database_name": "REPLACE_WITH_SHARED_DATABASE_NAME",
-      "database_id": "REPLACE_WITH_SHARED_DATABASE_ID"
+      "binding": "SUBSCRIPTIONS",
+      "id": "d436a6061a564700a15549af70984795"
     }
   ]
   // "vars": {

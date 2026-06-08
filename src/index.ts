@@ -7,7 +7,7 @@ type Bindings = {
   RUNPOD_ENDPOINT_ID: string;
   RUNPOD_API_KEY: string;
   RUNPOD_CALLBACK_SECRET: string;
-  DB: D1Database;
+  SUBSCRIPTIONS: KVNamespace;
 };
 
 type Plan = 'free' | 'monthly' | 'yearly';
@@ -32,58 +32,52 @@ const SYSTEM_PROMPT = `# Role
 
 const app = new Hono<{ Bindings: Bindings }>();
 
-type UserRecord = {
-  line_user_id: string;
+type SubscriptionRecord = {
   plan: Plan;
-  plan_expires_at: number | null;
-  daily_usage_count: number;
-  usage_reset_at: number;
+  expiresAt: number | null;
 };
 
-// 查詢使用者方案資訊；若不存在則建立一筆免費方案紀錄；若付費方案已過期則自動降級
-async function getActiveUser(db: D1Database, userId: string): Promise<UserRecord> {
+type UserUsage = {
+  plan: Plan;
+  dailyUsageCount: number;
+  usageResetAt: number;
+};
+
+const USAGE_KEY_PREFIX = 'usage:';
+
+// 從共用的 SUBSCRIPTIONS KV 讀取方案資訊；若無紀錄或已過期則視為 free
+async function getPlan(kv: KVNamespace, userId: string): Promise<Plan> {
+  const record = await kv.get<SubscriptionRecord>(userId, 'json');
+  if (!record) return 'free';
+
   const now = Math.floor(Date.now() / 1000);
-  const todayResetAt = nextMidnight(now);
-
-  let user = await db
-    .prepare('SELECT line_user_id, plan, plan_expires_at, daily_usage_count, usage_reset_at FROM users WHERE line_user_id = ?')
-    .bind(userId)
-    .first<UserRecord>();
-
-  if (!user) {
-    await db
-      .prepare('INSERT INTO users (line_user_id, plan, plan_expires_at, daily_usage_count, usage_reset_at) VALUES (?, ?, ?, ?, ?)')
-      .bind(userId, 'free', null, 0, todayResetAt)
-      .run();
-    return { line_user_id: userId, plan: 'free', plan_expires_at: null, daily_usage_count: 0, usage_reset_at: todayResetAt };
+  if (record.plan !== 'free' && record.expiresAt !== null && record.expiresAt < now) {
+    return 'free';
   }
-
-  // 付費方案到期 -> 自動降級為 free
-  if (user.plan !== 'free' && user.plan_expires_at !== null && user.plan_expires_at < now) {
-    await db
-      .prepare('UPDATE users SET plan = ?, plan_expires_at = NULL, updated_at = ? WHERE line_user_id = ?')
-      .bind('free', now, userId)
-      .run();
-    user = { ...user, plan: 'free', plan_expires_at: null };
-  }
-
-  // 跨日 -> 重置每日用量
-  if (now >= user.usage_reset_at) {
-    await db
-      .prepare('UPDATE users SET daily_usage_count = 0, usage_reset_at = ?, updated_at = ? WHERE line_user_id = ?')
-      .bind(todayResetAt, now, userId)
-      .run();
-    user = { ...user, daily_usage_count: 0, usage_reset_at: todayResetAt };
-  }
-
-  return user;
+  return record.plan;
 }
 
-async function incrementUsage(db: D1Database, userId: string): Promise<void> {
-  await db
-    .prepare('UPDATE users SET daily_usage_count = daily_usage_count + 1, updated_at = ? WHERE line_user_id = ?')
-    .bind(Math.floor(Date.now() / 1000), userId)
-    .run();
+// 讀取/初始化每日用量紀錄；跨日則自動重置
+async function getActiveUser(kv: KVNamespace, userId: string): Promise<UserUsage> {
+  const now = Math.floor(Date.now() / 1000);
+  const todayResetAt = nextMidnight(now);
+  const usageKey = USAGE_KEY_PREFIX + userId;
+
+  const plan = await getPlan(kv, userId);
+  const usage = await kv.get<UserUsage>(usageKey, 'json');
+
+  if (!usage || now >= usage.usageResetAt) {
+    const fresh: UserUsage = { plan, dailyUsageCount: 0, usageResetAt: todayResetAt };
+    await kv.put(usageKey, JSON.stringify(fresh));
+    return fresh;
+  }
+
+  return { ...usage, plan };
+}
+
+async function incrementUsage(kv: KVNamespace, userId: string, current: UserUsage): Promise<void> {
+  const updated: UserUsage = { ...current, dailyUsageCount: current.dailyUsageCount + 1 };
+  await kv.put(USAGE_KEY_PREFIX + userId, JSON.stringify(updated));
 }
 
 function nextMidnight(unixSeconds: number): number {
@@ -128,14 +122,14 @@ app.post('/webhook', async (c) => {
 
         try {
           // 查詢使用者方案 / 用量，並決定是否允許繼續對話
-          const user = await getActiveUser(c.env.DB, userId);
+          const user = await getActiveUser(c.env.SUBSCRIPTIONS, userId);
 
-          if (user.daily_usage_count >= dailyLimitFor(user.plan)) {
+          if (user.dailyUsageCount >= dailyLimitFor(user.plan)) {
             await pushMessageToLine(userId, '寶貝，今天的免費對話次數用完囉～想要繼續聊天，可以到網站升級方案唷！💛', c.env);
             return;
           }
 
-          await incrementUsage(c.env.DB, userId);
+          await incrementUsage(c.env.SUBSCRIPTIONS, userId, user);
 
           // 提交非同步任務給 RunPod，並附上回呼網址，讓 RunPod 處理完後主動通知我們
           await submitRunPodJob(userId, text, systemPromptFor(user.plan), origin, c.env);
