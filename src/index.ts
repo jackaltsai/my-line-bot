@@ -188,7 +188,18 @@ async function callTogetherAI(user: UserState, text: string, c: any): Promise<st
   }
 
   const data: any = await response.json();
-  return data.choices?.[0]?.message?.content || "我現在沒辦法思考";
+  const message = data.choices?.[0]?.message;
+
+  // Qwen3.5 等 reasoning 模型可能把思考放在 reasoning_content、content 夾帶 <think> 標籤或為空
+  let content: string = message?.content || message?.reasoning_content || '';
+  content = content.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+
+  if (!content) {
+    console.error('Together AI empty content, raw response:', JSON.stringify(data).slice(0, 2000));
+    return "我現在沒辦法思考";
+  }
+
+  return content;
 }
 
 // 每日主動問候訊息（依人設區分語氣）
