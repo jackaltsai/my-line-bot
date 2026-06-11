@@ -4,8 +4,8 @@ import { validateSignature } from '@line/bot-sdk';
 type Bindings = {
   LINE_CHANNEL_SECRET: string;
   LINE_CHANNEL_ACCESS_TOKEN: string;
-  RUNPOD_ENDPOINT_ID: string;
-  RUNPOD_API_KEY: string;
+  TOGETHER_API_KEY: string;
+  TOGETHER_MODEL: string;
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -30,8 +30,8 @@ app.post('/webhook', async (c) => {
         const userId = event.source.userId;
         const text = event.message.text;
 
-        // A. 呼叫 RunPod Serverless (非同步調用 /run)
-        const aiReply = await callRunPod(userId, text, c);
+        // A. 呼叫 Together AI Chat Completions
+        const aiReply = await callTogetherAI(userId, text, c);
 
         // B. 主動推播訊息回 LINE
         await pushMessageToLine(userId, aiReply, c);
@@ -43,20 +43,22 @@ app.post('/webhook', async (c) => {
   return c.json({ status: 'success' });
 });
 
-// 呼叫 RunPod API
-async function callRunPod(userId: string, text: string, c: any) {
-  const response = await fetch(`https://api.runpod.ai/v2/${c.env.RUNPOD_ENDPOINT_ID}/runsync`, {
+// 呼叫 Together AI Chat Completions API
+async function callTogetherAI(userId: string, text: string, c: any) {
+  const response = await fetch('https://api.together.xyz/v1/chat/completions', {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${c.env.RUNPOD_API_KEY}`,
+      'Authorization': `Bearer ${c.env.TOGETHER_API_KEY}`,
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify({ input: { userId, text } })
+    body: JSON.stringify({
+      model: c.env.TOGETHER_MODEL,
+      messages: [{ role: 'user', content: text }]
+    })
   });
-  
+
   const data: any = await response.json();
-  // 根據 RunPod 的輸出結構調整
-  return data.output?.message || "我現在沒辦法思考";
+  return data.choices?.[0]?.message?.content || "我現在沒辦法思考";
 }
 
 // 透過 LINE Messaging API 主動推播
