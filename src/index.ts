@@ -52,7 +52,7 @@ async function callTogetherAI(userId: string, text: string, c: any) {
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({
-      model: c.env.TOGETHER_MODEL || 'Qwen/Qwen2.5-72B-Instruct',
+      model: c.env.TOGETHER_MODEL || 'Qwen/Qwen3.5-397B-A17B',
       messages: [{ role: 'user', content: text }]
     })
   });
