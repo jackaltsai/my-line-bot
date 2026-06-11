@@ -179,8 +179,10 @@ async function callTogetherAI(user: UserState, text: string, c: any): Promise<st
       model: c.env.TOGETHER_MODEL || 'Qwen/Qwen3.5-397B-A17B',
       messages,
       temperature: 0.8,
-      // reasoning 模型會先輸出大量思考內容，token 給太少會在想完之前被截斷，導致 content 為空
-      max_tokens: 4096
+      // 聊天情境不需要 reasoning：關閉思考模式，避免大量思考 token 把回覆擠掉
+      chat_template_kwargs: { enable_thinking: false },
+      // 保險：就算思考模式仍開啟，也給足空間讓它想完並輸出回覆
+      max_tokens: 8192
     })
   });
 
