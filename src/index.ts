@@ -30,11 +30,18 @@ app.post('/webhook', async (c) => {
         const userId = event.source.userId;
         const text = event.message.text;
 
-        // A. 呼叫 Together AI Chat Completions
-        const aiReply = await callTogetherAI(userId, text, c);
+        try {
+          // A. 呼叫 Together AI Chat Completions
+          const aiReply = await callTogetherAI(userId, text, c);
 
-        // B. 主動推播訊息回 LINE
-        await pushMessageToLine(userId, aiReply, c);
+          // B. 主動推播訊息回 LINE
+          await pushMessageToLine(userId, aiReply, c);
+        } catch (err) {
+          console.error('Event handling failed:', err);
+          await pushMessageToLine(userId, '我現在沒辦法思考', c).catch((e) =>
+            console.error('Fallback push failed:', e)
+          );
+        }
       }
     }))
   );
@@ -57,13 +64,18 @@ async function callTogetherAI(userId: string, text: string, c: any) {
     })
   });
 
+  if (!response.ok) {
+    console.error('Together AI error:', response.status, await response.text());
+    return "我現在沒辦法思考";
+  }
+
   const data: any = await response.json();
   return data.choices?.[0]?.message?.content || "我現在沒辦法思考";
 }
 
 // 透過 LINE Messaging API 主動推播
 async function pushMessageToLine(userId: string, text: string, c: any) {
-  await fetch('https://api.line.me/v2/bot/message/push', {
+  const response = await fetch('https://api.line.me/v2/bot/message/push', {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${c.env.LINE_CHANNEL_ACCESS_TOKEN}`,
@@ -74,6 +86,10 @@ async function pushMessageToLine(userId: string, text: string, c: any) {
       messages: [{ type: 'text', text }]
     })
   });
+
+  if (!response.ok) {
+    console.error('LINE push error:', response.status, await response.text());
+  }
 }
 
 export default app;
