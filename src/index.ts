@@ -6,7 +6,14 @@ type Bindings = {
   LINE_CHANNEL_ACCESS_TOKEN: string;
   TOGETHER_API_KEY: string;
   TOGETHER_MODEL: string;
+  SYSTEM_PROMPT: string;
 };
+
+// 預設人設，可用 SYSTEM_PROMPT 環境變數覆蓋
+const DEFAULT_SYSTEM_PROMPT = `你是一位成熟穩重的聊天夥伴。
+- 用繁體中文回覆，語氣自然、像朋友聊天，不要像客服
+- 回覆簡短（1~3 句），適合 LINE 對話，不要用條列式或 Markdown 格式
+- 不確定對方意思時，自然地順著話題聊，不要反問一連串問題`;
 
 const app = new Hono<{ Bindings: Bindings }>();
 
@@ -60,7 +67,11 @@ async function callTogetherAI(userId: string, text: string, c: any) {
     },
     body: JSON.stringify({
       model: c.env.TOGETHER_MODEL || 'Qwen/Qwen3.5-397B-A17B',
-      messages: [{ role: 'user', content: text }]
+      messages: [
+        { role: 'system', content: c.env.SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT },
+        { role: 'user', content: text }
+      ],
+      temperature: 0.8
     })
   });
 
