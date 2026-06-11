@@ -10,7 +10,7 @@ type Bindings = {
 
 const app = new Hono<{ Bindings: Bindings }>();
 
-// 核心邏輯：收到訊息 -> 立即回應 200 -> 非同步呼叫 RunPod -> 推播回 LINE
+// 核心邏輯：收到訊息 -> 立即回應 200 -> 非同步呼叫 Together AI -> 推播回 LINE
 app.post('/webhook', async (c) => {
   const signature = c.req.header('x-line-signature') || '';
   const body = await c.req.text();
