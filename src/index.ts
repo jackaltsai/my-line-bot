@@ -178,7 +178,9 @@ async function callTogetherAI(user: UserState, text: string, c: any): Promise<st
     body: JSON.stringify({
       model: c.env.TOGETHER_MODEL || 'Qwen/Qwen3.5-397B-A17B',
       messages,
-      temperature: 0.8
+      temperature: 0.8,
+      // reasoning 模型會先輸出大量思考內容，token 給太少會在想完之前被截斷，導致 content 為空
+      max_tokens: 4096
     })
   });
 
@@ -190,12 +192,12 @@ async function callTogetherAI(user: UserState, text: string, c: any): Promise<st
   const data: any = await response.json();
   const message = data.choices?.[0]?.message;
 
-  // Qwen3.5 等 reasoning 模型可能把思考放在 reasoning_content、content 夾帶 <think> 標籤或為空
-  let content: string = message?.content || message?.reasoning_content || '';
-  content = content.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+  // reasoning 模型的 content 可能夾帶 <think> 標籤，需剝除
+  const content: string = (message?.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
 
   if (!content) {
-    console.error('Together AI empty content, raw response:', JSON.stringify(data).slice(0, 2000));
+    const finishReason = data.choices?.[0]?.finish_reason;
+    console.error(`Together AI empty content (finish_reason: ${finishReason}), raw response:`, JSON.stringify(data).slice(0, 2000));
     return "我現在沒辦法思考";
   }
 
