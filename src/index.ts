@@ -16,6 +16,10 @@ import {
   type UserState
 } from './db';
 import { FREE_SYSTEM_PROMPT, PERSONAS, getPersona, type PersonaId } from './personas';
+import * as OpenCC from 'opencc-js';
+
+// 簡轉繁保險：模型偶爾仍會漏出簡體字，統一在輸出前轉換成台灣正體
+const toTraditional = OpenCC.Converter({ from: 'cn', to: 'twp' });
 
 type Bindings = {
   LINE_CHANNEL_SECRET: string;
@@ -262,7 +266,7 @@ async function callTogetherAI(user: UserState, text: string, c: any): Promise<st
     return "我現在沒辦法思考";
   }
 
-  return content;
+  return toTraditional(content);
 }
 
 // 貼圖回應（依人設與貼圖情緒區分語氣），不消耗對話額度也不呼叫 AI
