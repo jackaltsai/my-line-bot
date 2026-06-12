@@ -1,38 +1,49 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "my-line-bot",
-  "main": "src/index.ts",
-  "compatibility_date": "2026-06-08"
-  // "compatibility_flags": [
-  //   "nodejs_compat"
-  // ],
-  // "vars": {
-  //   "MY_VAR": "my-variable"
-  // },
-  // "kv_namespaces": [
-  //   {
-  //     "binding": "MY_KV_NAMESPACE",
-  //     "id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-  //   }
-  // ],
-  // "r2_buckets": [
-  //   {
-  //     "binding": "MY_BUCKET",
-  //     "bucket_name": "my-bucket"
-  //   }
-  // ],
-  // "d1_databases": [
-  //   {
-  //     "binding": "MY_DB",
-  //     "database_name": "my-database",
-  //     "database_id": ""
-  //   }
-  // ],
-  // "ai": {
-  //   "binding": "AI"
-  // },
-  // "observability": {
-  //   "enabled": true,
-  //   "head_sampling_rate": 1
-  // }
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "my-line-bot",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-06-08",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"observability": {
+		"enabled": true,
+		"head_sampling_rate": 1
+	},
+	"triggers": {
+		// 每天 01:00 UTC（台灣時間 09:00）推播每日問候給付費方案使用者
+		"crons": [
+			"0 1 * * *"
+		]
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "my-line-bot-db",
+			"database_id": "804c53b2-3aea-4222-9ee5-77da7c217cc6"
+		},
+		{
+			"binding": "my_line_bot_db",
+			"database_name": "my-line-bot-db",
+			"database_id": "804c53b2-3aea-4222-9ee5-77da7c217cc6"
+		}
+	]
+	// "vars": {
+	//   "MY_VAR": "my-variable"
+	// },
+	// "kv_namespaces": [
+	//   {
+	//     "binding": "MY_KV_NAMESPACE",
+	//     "id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+	//   }
+	// ],
+	// "r2_buckets": [
+	//   {
+	//     "binding": "MY_BUCKET",
+	//     "bucket_name": "my-bucket"
+	//   }
+	// ],
+	// "ai": {
+	//   "binding": "AI"
+	// },
 }
