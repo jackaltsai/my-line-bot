@@ -13,7 +13,8 @@ export interface UserState {
 }
 
 function today(): string {
-  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+  // 以台灣時區（UTC+8）計算日期，讓免費額度在台灣午夜重置
+  return new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
 }
 
 // 取得使用者狀態，若不存在則建立預設（免費方案）資料

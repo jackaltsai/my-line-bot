@@ -19,6 +19,8 @@ type Bindings = {
   LINE_CHANNEL_ACCESS_TOKEN: string;
   TOGETHER_API_KEY: string;
   TOGETHER_MODEL: string;
+  TOGETHER_MODEL_FREE: string;
+  TOGETHER_MODEL_PREMIUM: string;
   ADMIN_SECRET: string;
   DB: D1Database;
 };
@@ -178,6 +180,11 @@ async function callTogetherAI(user: UserState, text: string, c: any): Promise<st
 
   messages.push({ role: 'user', content: text });
 
+  // 雙模型分級：免費用快速小模型省成本，付費用大模型提升品質
+  const model = user.plan === 'premium'
+    ? (c.env.TOGETHER_MODEL_PREMIUM || c.env.TOGETHER_MODEL || 'Qwen/Qwen3.5-397B-A17B')
+    : (c.env.TOGETHER_MODEL_FREE || 'Qwen/Qwen2.5-7B-Instruct-Turbo');
+
   const response = await fetch('https://api.together.xyz/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -185,7 +192,7 @@ async function callTogetherAI(user: UserState, text: string, c: any): Promise<st
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({
-      model: c.env.TOGETHER_MODEL || 'Qwen/Qwen3.5-397B-A17B',
+      model,
       messages,
       temperature: 0.8,
       // 聊天情境不需要 reasoning：關閉思考模式，避免大量思考 token 把回覆擠掉
