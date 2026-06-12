@@ -142,3 +142,41 @@ export async function getPremiumUsers(db: D1Database): Promise<string[]> {
 
   return (results || []).map((r) => r.line_user_id);
 }
+
+// 記錄一次 AI 回應的 token 用量
+export async function logUsage(
+  db: D1Database,
+  lineUserId: string,
+  plan: string,
+  model: string,
+  promptTokens: number,
+  completionTokens: number
+): Promise<void> {
+  await db
+    .prepare('INSERT INTO usage_log (line_user_id, plan, model, prompt_tokens, completion_tokens) VALUES (?, ?, ?, ?, ?)')
+    .bind(lineUserId, plan, model, promptTokens, completionTokens)
+    .run();
+}
+
+export interface UsageSummaryRow {
+  model: string;
+  requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+}
+
+// 用量彙總（成本報表）：依模型分組，可限定起始日（YYYY-MM-DD，UTC）
+export async function getUsageSummary(db: D1Database, sinceDate?: string): Promise<UsageSummaryRow[]> {
+  const where = sinceDate ? "WHERE created_at >= ?" : '';
+  const stmt = db.prepare(
+    `SELECT model,
+            COUNT(*) AS requests,
+            SUM(prompt_tokens) AS prompt_tokens,
+            SUM(completion_tokens) AS completion_tokens
+     FROM usage_log ${where}
+     GROUP BY model
+     ORDER BY requests DESC`
+  );
+  const { results } = await (sinceDate ? stmt.bind(sinceDate) : stmt).all<UsageSummaryRow>();
+  return results || [];
+}

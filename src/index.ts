@@ -7,7 +7,9 @@ import {
   getOrCreateUser,
   getPremiumUsers,
   getRecentMessages,
+  getUsageSummary,
   hasQuota,
+  logUsage,
   saveMessage,
   setPersona,
   upgradeToPremium,
@@ -161,6 +163,28 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
     return null;
   }
 
+  // 管理員用量報表：「/admin usage <ADMIN_SECRET>」顯示今日與累計的 token 用量
+  if (text.startsWith('/admin usage ')) {
+    const secret = text.slice('/admin usage '.length).trim();
+    if (c.env.ADMIN_SECRET && secret === c.env.ADMIN_SECRET) {
+      const todayUtc = new Date().toISOString().slice(0, 10);
+      const [todayRows, totalRows] = await Promise.all([
+        getUsageSummary(db, todayUtc),
+        getUsageSummary(db)
+      ]);
+
+      const format = (rows: typeof totalRows) =>
+        rows.length === 0
+          ? '（無資料）'
+          : rows
+              .map((r) => `${r.model}\n  ${r.requests} 則｜輸入 ${r.prompt_tokens}｜輸出 ${r.completion_tokens} tokens`)
+              .join('\n');
+
+      return `【今日用量（UTC）】\n${format(todayRows)}\n\n【累計用量】\n${format(totalRows)}`;
+    }
+    return null;
+  }
+
   // 管理員手動降級（測試用）：「/admin downgrade <ADMIN_SECRET>」
   // 會歸零付費額度、清除長期記憶並重置人設
   if (text.startsWith('/admin downgrade ')) {
@@ -221,6 +245,13 @@ async function callTogetherAI(user: UserState, text: string, c: any): Promise<st
 
   const data: any = await response.json();
   const message = data.choices?.[0]?.message;
+
+  // 記錄 token 用量（失敗不影響回覆）
+  const usage = data.usage;
+  if (usage) {
+    await logUsage(db, user.line_user_id, user.plan, model, usage.prompt_tokens || 0, usage.completion_tokens || 0)
+      .catch((e) => console.error('logUsage failed:', e));
+  }
 
   // reasoning 模型的 content 可能夾帶 <think> 標籤，需剝除
   const content: string = (message?.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
