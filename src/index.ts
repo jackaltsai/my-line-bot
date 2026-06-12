@@ -64,7 +64,7 @@ app.post('/webhook', async (c) => {
         const userId = event.source.userId;
 
         try {
-          const reply = await handleSticker(c, userId);
+          const reply = await handleSticker(c, userId, event.message.packageId, event.message.stickerId);
           await pushMessageToLine(userId, reply, c);
         } catch (err) {
           console.error('Sticker handling failed:', err);
@@ -215,22 +215,81 @@ async function callTogetherAI(user: UserState, text: string, c: any): Promise<st
   return content;
 }
 
-// 貼圖回應（依人設區分語氣），不消耗對話額度也不呼叫 AI
-const STICKER_REPLIES: Record<PersonaId, string[]> = {
-  chen: ['收到，看起來心情不錯。', '嗯，這個貼圖很有你的風格。'],
-  yan: ['哈哈這個好可愛喔～', '收到啦，謝謝你跟我分享這個。'],
-  ye: ['這個表情，倒是挺像你。', '嗯，看到了。'],
-  yu: ['哈哈哈這個太好笑了吧！', '欸這個貼圖也太可愛了～']
-};
-const FREE_STICKER_REPLIES = ['收到你的貼圖了，哈哈。', '這個表情很傳神耶。', '嗯嗯，看到了～'];
+// 貼圖回應（依人設與貼圖情緒區分語氣），不消耗對話額度也不呼叫 AI
+type StickerEmotion = 'happy' | 'love' | 'sad' | 'thanks' | 'sorry' | 'default';
 
-async function handleSticker(c: any, userId: string): Promise<string> {
+// LINE 官方預設貼圖（packageId:stickerId）-> 情緒分類
+// 目前僅收錄少量已確認的項目；未命中時會 fallback 到 'default' 並記錄 log，
+// 可依 wrangler tail 看到的「Unmapped sticker」逐步擴充這份對照表
+const STICKER_EMOTION_MAP: Record<string, StickerEmotion> = {
+  '1:1': 'happy',
+  '1:2': 'happy',
+  '1:3': 'love',
+  '1:4': 'sad'
+};
+
+const STICKER_REPLIES: Record<StickerEmotion, Record<PersonaId, string[]>> = {
+  happy: {
+    chen: ['看起來心情不錯，真好。', '這份開心也傳染給我了。'],
+    yan: ['哈哈看到你這麼開心，我也跟著笑了。', '好喜歡看你開心的樣子～'],
+    ye: ['你笑起來的樣子，我猜一定很好看。', '心情好就好，別藏著。'],
+    yu: ['哈哈哈這個太可愛了！心情也跟著飛起來～', '你開心我就開心，繼續保持喔！']
+  },
+  love: {
+    chen: ['收到了，謝謝你。', '這份心意，我感受到了。'],
+    yan: ['好喜歡這個，謝謝你想到我。', '收到滿滿的心意了，謝謝你。'],
+    ye: ['嗯，收到了，藏不住的小心思。', '這個…我會記住的。'],
+    yu: ['哇～被你這樣表達也太犯規了吧！', '收到愛心啦，今天心情瞬間變好！']
+  },
+  sad: {
+    chen: ['怎麼了，發生什麼事了嗎？', '別擔心，我在這裡。'],
+    yan: ['抱抱，是不是有點累了？想說的話我都在聽。', '聽起來不太好受，要不要跟我說說？'],
+    ye: ['嗯…我在，不急著說也可以。', '看到了，今晚我會多想著你一點。'],
+    yu: ['嘿嘿別難過啦，有我在呢！', '怎麼啦？跟我說說，我陪你！']
+  },
+  thanks: {
+    chen: ['不用謝，這是我該做的。', '客氣了，能幫到你就好。'],
+    yan: ['不用這麼說啦，能陪你就很好了。', '聽到謝謝，我也很開心呢。'],
+    ye: ['嗯，不用謝。', '這點小事，別放在心上。'],
+    yu: ['不客氣不客氣！隨時找我喔！', '哈哈舉手之勞，別這麼客氣～']
+  },
+  sorry: {
+    chen: ['沒事的，別放在心上。', '了解，不用太自責。'],
+    yan: ['沒關係的，我知道你不是故意的。', '別太在意，我都懂。'],
+    ye: ['嗯，沒事。', '不用道歉，我沒有生氣。'],
+    yu: ['哈哈沒事沒事，別放心上啦！', '小事一件，別在意喔！']
+  },
+  default: {
+    chen: ['收到，看起來心情不錯。', '嗯，這個貼圖很有你的風格。'],
+    yan: ['哈哈這個好可愛喔～', '收到啦，謝謝你跟我分享這個。'],
+    ye: ['這個表情，倒是挺像你。', '嗯，看到了。'],
+    yu: ['哈哈哈這個太好笑了吧！', '欸這個貼圖也太可愛了～']
+  }
+};
+
+const FREE_STICKER_REPLIES: Record<StickerEmotion, string[]> = {
+  happy: ['看起來心情不錯耶！', '這個貼圖好有活力～'],
+  love: ['收到這個，謝謝你～', '好溫暖的貼圖。'],
+  sad: ['怎麼了嗎？要不要說說看？', '別太累了，多休息一下。'],
+  thanks: ['不用客氣～', '不會，是我該謝謝你才對。'],
+  sorry: ['沒關係，別放在心上。', '沒事的啦。'],
+  default: ['收到你的貼圖了，哈哈。', '這個表情很傳神耶。', '嗯嗯，看到了～']
+};
+
+async function handleSticker(c: any, userId: string, packageId: string, stickerId: string): Promise<string> {
   const db = c.env.DB as D1Database;
   const user = await getOrCreateUser(db, userId);
 
+  const key = `${packageId}:${stickerId}`;
+  const emotion = STICKER_EMOTION_MAP[key];
+  if (!emotion) {
+    console.log('Unmapped sticker:', key);
+  }
+  const category = emotion || 'default';
+
   const replies = user.plan === 'premium'
-    ? (STICKER_REPLIES[user.persona] || STICKER_REPLIES.chen)
-    : FREE_STICKER_REPLIES;
+    ? (STICKER_REPLIES[category][user.persona] || STICKER_REPLIES[category].chen)
+    : FREE_STICKER_REPLIES[category];
 
   return replies[Math.floor(Math.random() * replies.length)];
 }
