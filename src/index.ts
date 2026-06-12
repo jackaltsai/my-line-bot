@@ -60,6 +60,15 @@ app.post('/webhook', async (c) => {
             console.error('Fallback push failed:', e)
           );
         }
+      } else if (event.type === 'message' && event.message.type === 'sticker') {
+        const userId = event.source.userId;
+
+        try {
+          const reply = await handleSticker(c, userId);
+          await pushMessageToLine(userId, reply, c);
+        } catch (err) {
+          console.error('Sticker handling failed:', err);
+        }
       }
     }))
   );
@@ -204,6 +213,26 @@ async function callTogetherAI(user: UserState, text: string, c: any): Promise<st
   }
 
   return content;
+}
+
+// 貼圖回應（依人設區分語氣），不消耗對話額度也不呼叫 AI
+const STICKER_REPLIES: Record<PersonaId, string[]> = {
+  chen: ['收到，看起來心情不錯。', '嗯，這個貼圖很有你的風格。'],
+  yan: ['哈哈這個好可愛喔～', '收到啦，謝謝你跟我分享這個。'],
+  ye: ['這個表情，倒是挺像你。', '嗯，看到了。'],
+  yu: ['哈哈哈這個太好笑了吧！', '欸這個貼圖也太可愛了～']
+};
+const FREE_STICKER_REPLIES = ['收到你的貼圖了，哈哈。', '這個表情很傳神耶。', '嗯嗯，看到了～'];
+
+async function handleSticker(c: any, userId: string): Promise<string> {
+  const db = c.env.DB as D1Database;
+  const user = await getOrCreateUser(db, userId);
+
+  const replies = user.plan === 'premium'
+    ? (STICKER_REPLIES[user.persona] || STICKER_REPLIES.chen)
+    : FREE_STICKER_REPLIES;
+
+  return replies[Math.floor(Math.random() * replies.length)];
 }
 
 // 每日主動問候訊息（依人設區分語氣）
