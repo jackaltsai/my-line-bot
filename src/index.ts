@@ -225,7 +225,8 @@ const STICKER_EMOTION_MAP: Record<string, StickerEmotion> = {
   '1:1': 'happy',
   '1:2': 'happy',
   '1:3': 'love',
-  '1:4': 'sad'
+  '1:4': 'sad',
+  '1237353:9631482': 'happy'
 };
 
 const STICKER_REPLIES: Record<StickerEmotion, Record<PersonaId, string[]>> = {
