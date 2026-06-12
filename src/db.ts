@@ -99,6 +99,18 @@ export async function upgradeToPremium(db: D1Database, lineUserId: string, credi
     .run();
 }
 
+// 降回免費方案：歸零付費額度並清除長期記憶（測試用）
+export async function downgradeToFree(db: D1Database, lineUserId: string): Promise<void> {
+  await db
+    .prepare('UPDATE users SET plan = \'free\', premium_credits = 0, persona = \'chen\', updated_at = datetime(\'now\') WHERE line_user_id = ?')
+    .bind(lineUserId)
+    .run();
+  await db
+    .prepare('DELETE FROM messages WHERE line_user_id = ?')
+    .bind(lineUserId)
+    .run();
+}
+
 // 取得最近對話紀錄（付費方案的長期記憶），由舊到新排序
 export async function getRecentMessages(db: D1Database, lineUserId: string, limit = 20) {
   const { results } = await db

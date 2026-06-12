@@ -3,6 +3,7 @@ import { validateSignature } from '@line/bot-sdk';
 import {
   FREE_DAILY_LIMIT,
   consumeQuota,
+  downgradeToFree,
   getOrCreateUser,
   getPremiumUsers,
   getRecentMessages,
@@ -156,6 +157,17 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
     if (c.env.ADMIN_SECRET && secret === c.env.ADMIN_SECRET) {
       await upgradeToPremium(db, user.line_user_id);
       return '已升級為付費方案，獲得 1500 則對話額度！輸入「人設」可切換喜歡的人設 💛';
+    }
+    return null;
+  }
+
+  // 管理員手動降級（測試用）：「/admin downgrade <ADMIN_SECRET>」
+  // 會歸零付費額度、清除長期記憶並重置人設
+  if (text.startsWith('/admin downgrade ')) {
+    const secret = text.slice('/admin downgrade '.length).trim();
+    if (c.env.ADMIN_SECRET && secret === c.env.ADMIN_SECRET) {
+      await downgradeToFree(db, user.line_user_id);
+      return '已降回免費方案：付費額度歸零、長期記憶已清除、人設重置為「沉」。';
     }
     return null;
   }
