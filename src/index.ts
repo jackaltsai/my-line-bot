@@ -28,6 +28,7 @@ type Bindings = {
   TOGETHER_MODEL: string;
   TOGETHER_MODEL_FREE: string;
   TOGETHER_MODEL_PREMIUM: string;
+  PREMIUM_HISTORY_LIMIT: string;
   ADMIN_SECRET: string;
   DB: D1Database;
 };
@@ -212,7 +213,8 @@ async function callTogetherAI(user: UserState, text: string, c: any): Promise<st
     const persona = getPersona(user.persona);
     messages.push({ role: 'system', content: persona.premiumPrompt });
 
-    const history = await getRecentMessages(db, user.line_user_id, 20);
+    const historyLimit = parseInt(c.env.PREMIUM_HISTORY_LIMIT, 10) || 20;
+    const history = await getRecentMessages(db, user.line_user_id, historyLimit);
     messages.push(...history);
   } else {
     messages.push({ role: 'system', content: FREE_SYSTEM_PROMPT });
