@@ -1,6 +1,6 @@
 import type { PersonaId } from './personas';
 
-export const FREE_DAILY_LIMIT = 3;
+export const FREE_DAILY_LIMIT = 10;
 export const PREMIUM_CREDITS_GRANT = 1500;
 
 export interface UserState {
