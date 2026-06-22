@@ -353,7 +353,7 @@ async function handleSticker(c: any, userId: string, packageId: string, stickerI
 
 // 每日主動問候訊息（依人設區分語氣）
 const DAILY_GREETINGS: Record<PersonaId, string[]> = {
-  chen: ['早安，今天也要好好照顧自己。', '想到你了，今天過得還順利嗎？'],
+  chen: ['早安，今天也要好好照顧自己。', '剛醒來就想到你，希望你今天一切順心'],
   yan: ['早安☺️ 昨晚有睡好嗎？', '突然想跟你說聲早安，今天也要加油喔。'],
   ye: ['醒了嗎，剛剛想到你了。', '今天的天氣讓我想起你，在做什麼呢？'],
   yu: ['早安！新的一天也要元氣滿滿喔！☀️', '嘿，起床了嗎？今天想跟你聊點什麼呢～']
