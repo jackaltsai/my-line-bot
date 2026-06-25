@@ -393,7 +393,12 @@ async function pushMessageToLine(userId: string, text: string, c: any) {
   });
 
   if (!response.ok) {
-    console.error('LINE push error:', response.status, await response.text());
+    const body = await response.text();
+    if (response.status === 429) {
+      console.error('[ALERT] LINE monthly push limit reached. Upgrade required.', body);
+    } else {
+      console.error('LINE push error:', response.status, body);
+    }
   }
 }
 
