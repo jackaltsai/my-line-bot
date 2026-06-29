@@ -204,7 +204,52 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
   return null;
 }
 
-// 呼叫 Together AI Chat Completions API
+// 單次 Together AI 請求，回傳剝除 <think> 後的內容；失敗或空內容時回傳 null
+async function fetchTogetherAI(
+  messages: { role: string; content: string }[],
+  model: string,
+  apiKey: string
+): Promise<{ content: string; usage: any } | null> {
+  let response: Response;
+  try {
+    response = await fetch('https://api.together.xyz/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        temperature: 0.8,
+        chat_template_kwargs: { enable_thinking: false },
+        max_tokens: 8192
+      })
+    });
+  } catch (e) {
+    console.error('Together AI fetch exception:', e);
+    return null;
+  }
+
+  if (!response.ok) {
+    console.error('Together AI error:', response.status, await response.text());
+    return null;
+  }
+
+  const data: any = await response.json();
+  const content: string = (data.choices?.[0]?.message?.content || '')
+    .replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+
+  if (!content) {
+    const finishReason = data.choices?.[0]?.finish_reason;
+    console.error(`Together AI empty content (finish_reason: ${finishReason}), raw:`, JSON.stringify(data).slice(0, 2000));
+    return null;
+  }
+
+  return { content, usage: data.usage };
+}
+
+// 呼叫 Together AI Chat Completions API，失敗時自動重試一次（換備用模型）
 async function callTogetherAI(user: UserState, text: string, c: any): Promise<string> {
   const db = c.env.DB as D1Database;
   const messages: { role: string; content: string }[] = [];
@@ -223,52 +268,32 @@ async function callTogetherAI(user: UserState, text: string, c: any): Promise<st
   messages.push({ role: 'user', content: text });
 
   // 雙模型分級：免費用快速小模型省成本，付費用大模型提升品質
-  const model = user.plan === 'premium'
+  const primaryModel = user.plan === 'premium'
     ? (c.env.TOGETHER_MODEL_PREMIUM || c.env.TOGETHER_MODEL || 'Qwen/Qwen3.5-397B-A17B')
     : (c.env.TOGETHER_MODEL_FREE || 'Qwen/Qwen2.5-7B-Instruct-Turbo');
 
-  const response = await fetch('https://api.together.xyz/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${c.env.TOGETHER_API_KEY}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model,
-      messages,
-      temperature: 0.8,
-      // 聊天情境不需要 reasoning：關閉思考模式，避免大量思考 token 把回覆擠掉
-      chat_template_kwargs: { enable_thinking: false },
-      // 保險：就算思考模式仍開啟，也給足空間讓它想完並輸出回覆
-      max_tokens: 8192
-    })
-  });
+  // 備用模型：主模型失敗時 fallback，避免客戶看到錯誤訊息
+  const fallbackModel = c.env.TOGETHER_MODEL_FALLBACK || 'meta-llama/Llama-3.3-70B-Instruct-Turbo';
 
-  if (!response.ok) {
-    console.error('Together AI error:', response.status, await response.text());
+  const apiKey: string = c.env.TOGETHER_API_KEY;
+
+  let result = await fetchTogetherAI(messages, primaryModel, apiKey);
+
+  if (!result) {
+    console.warn(`Primary model (${primaryModel}) failed, retrying with fallback (${fallbackModel})`);
+    result = await fetchTogetherAI(messages, fallbackModel, apiKey);
+  }
+
+  if (!result) {
     return "我現在沒辦法思考";
   }
 
-  const data: any = await response.json();
-  const message = data.choices?.[0]?.message;
-
-  // 記錄 token 用量（失敗不影響回覆）
-  const usage = data.usage;
-  if (usage) {
-    await logUsage(db, user.line_user_id, user.plan, model, usage.prompt_tokens || 0, usage.completion_tokens || 0)
+  if (result.usage) {
+    await logUsage(db, user.line_user_id, user.plan, primaryModel, result.usage.prompt_tokens || 0, result.usage.completion_tokens || 0)
       .catch((e) => console.error('logUsage failed:', e));
   }
 
-  // reasoning 模型的 content 可能夾帶 <think> 標籤，需剝除
-  const content: string = (message?.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-
-  if (!content) {
-    const finishReason = data.choices?.[0]?.finish_reason;
-    console.error(`Together AI empty content (finish_reason: ${finishReason}), raw response:`, JSON.stringify(data).slice(0, 2000));
-    return "我現在沒辦法思考";
-  }
-
-  return toTraditional(content);
+  return toTraditional(result.content);
 }
 
 // 貼圖回應（依人設與貼圖情緒區分語氣），不消耗對話額度也不呼叫 AI
