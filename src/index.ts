@@ -2,16 +2,25 @@ import { Hono } from 'hono';
 import { validateSignature } from '@line/bot-sdk';
 import {
   FREE_DAILY_LIMIT,
+  addMilestoneTrigger,
   consumeQuota,
   downgradeToFree,
   getOrCreateUser,
   getPremiumUsers,
   getRecentMessages,
   getUsageSummary,
+  getUsersForSilenceCheck,
+  hadConversationYesterday,
   hasQuota,
+  incrementTotalTurns,
   logUsage,
+  markPaywallTriggered,
   saveMessage,
+  saveOnboardingAnswer,
   setPersona,
+  updateLastActive,
+  updateOnboardingStep,
+  updateSilenceStage,
   upgradeToPremium,
   type UserState
 } from './db';
@@ -42,6 +51,11 @@ const PERSONA_NAME_TO_ID: Record<string, PersonaId> = {
   '嶼': 'yu'
 };
 
+// Onboarding Q1 選項（壓力來源）
+const Q1_OPTIONS = ['工作', '感情', '家庭', '其他'];
+// Onboarding Q2 選項（陪伴風格）
+const Q2_OPTIONS = ['溫柔體貼', '幽默逗趣', '安靜陪伴', '都可以'];
+
 // 核心邏輯：收到訊息 -> 立即回應 200 -> 非同步處理（額度檢查/指令/AI 回覆）-> 推播回 LINE
 app.post('/webhook', async (c) => {
   const signature = c.req.header('x-line-signature') || '';
@@ -57,13 +71,22 @@ app.post('/webhook', async (c) => {
 
   c.executionCtx.waitUntil(
     Promise.all(events.map(async (event: any) => {
-      if (event.type === 'message' && event.message.type === 'text') {
+      if (event.type === 'follow') {
+        const userId = event.source.userId;
+        try {
+          await handleFollow(c, userId);
+        } catch (err) {
+          console.error('Follow handling failed:', err);
+        }
+      } else if (event.type === 'message' && event.message.type === 'text') {
         const userId = event.source.userId;
         const text = event.message.text.trim();
 
         try {
           const reply = await handleMessage(c, userId, text);
-          await pushMessageToLine(userId, reply, c);
+          if (reply !== null) {
+            await pushMessageToLine(userId, reply, c);
+          }
         } catch (err) {
           console.error('Event handling failed:', err);
           await pushMessageToLine(userId, '我現在沒辦法思考', c).catch((e) =>
@@ -87,39 +110,165 @@ app.post('/webhook', async (c) => {
   return c.json({ status: 'success' });
 });
 
-async function handleMessage(c: any, userId: string, text: string): Promise<string> {
+// handleMessage 回傳 null 代表已由內部處理（onboarding 多訊息推播），不需外層再 push
+async function handleMessage(c: any, userId: string, text: string): Promise<string | null> {
   const db = c.env.DB as D1Database;
   const user = await getOrCreateUser(db, userId);
 
-  // 指令處理
+  // 新用戶第一則訊息：follow 事件沒觸發時的 fallback 開場白
+  if (user.is_new) {
+    const displayName = await getLineUserProfile(userId, c.env.LINE_CHANNEL_ACCESS_TOKEN);
+    return buildWelcomeMessage(displayName);
+  }
+
+  // 更新最後活躍時間（重置沉默計時器）
+  await updateLastActive(db, userId);
+
+  // Onboarding 未完成時，交由狀態機處理
+  if (user.onboarding_step < 4) {
+    await handleOnboarding(c, user, text);
+    return null;
+  }
+
+  // 付費牆觸發檢查：免費方案使用滿 7 天且尚未觸發
+  if (user.plan === 'free' && !user.paywall_triggered && user.join_date) {
+    const joinTs = new Date(user.join_date).getTime();
+    const daysSinceJoin = (Date.now() - joinTs) / (1000 * 60 * 60 * 24);
+    if (daysSinceJoin >= 7) {
+      await markPaywallTriggered(db, userId);
+      // 先處理這次訊息，再推播付費牆
+      const reply = await processNormalMessage(c, user, text);
+      if (reply !== null) await pushMessageToLine(userId, reply, c);
+      await pushQuickReplyToLine(
+        userId,
+        '我有點擔心...我們聊了這麼多，但我的記性沒辦法撐太久。\n有些你跟我說過的事，我可能會慢慢記不住。\n你願意讓我繼續記得你嗎？',
+        ['讓你記得我', '下次再說'],
+        c
+      );
+      return null;
+    }
+  }
+
+  return processNormalMessage(c, user, text);
+}
+
+// 一般對話流程（指令處理 + AI 回覆）
+async function processNormalMessage(c: any, user: UserState, text: string): Promise<string | null> {
+  const db = c.env.DB as D1Database;
+
   const command = await handleCommand(c, user, text);
   if (command !== null) {
     return command;
   }
 
-  // 額度檢查
   if (!hasQuota(user)) {
     return user.plan === 'premium'
       ? '你的對話額度已經用完囉，感謝你一直以來的陪伴 🥹 期待未來能再續約繼續聊天～'
       : `今天的免費額度（${FREE_DAILY_LIMIT} 則）已經用完了，明天再來找我聊天吧！想要更多對話次數、長期記憶與更多人設，可以輸入「升級」了解付費方案 💛`;
   }
 
-  // 呼叫 AI 並回覆
   const reply = await callTogetherAI(user, text, c);
 
   await consumeQuota(db, user);
   if (user.plan === 'premium') {
-    await saveMessage(db, userId, 'user', text);
-    await saveMessage(db, userId, 'assistant', reply);
+    await saveMessage(db, user.line_user_id, 'user', text);
+    await saveMessage(db, user.line_user_id, 'assistant', reply);
   }
 
+  // 遞增對話輪次並非同步檢查里程碑（不阻塞主回覆）
+  incrementTotalTurns(db, user.line_user_id).then((newTurns) =>
+    checkAndSendMilestones(c, user, newTurns).catch((e) =>
+      console.error('Milestone check failed:', e)
+    )
+  );
+
   return reply;
+}
+
+// Onboarding 狀態機（1-2）
+// step 0: 剛加入，顯示隱私承諾 + Q1
+// step 1: 等待 Q1 答案 → 存 q1，顯示 Q2
+// step 2: 等待 Q2 答案 → 存 q2，顯示 Q3（暱稱輸入）
+// step 3: 等待暱稱 → 存 nickname，確認完成
+async function handleOnboarding(c: any, user: UserState, text: string): Promise<void> {
+  const db = c.env.DB as D1Database;
+  const userId = user.line_user_id;
+
+  if (user.onboarding_step === 0) {
+    // 隱私承諾（6-1）+ Q1
+    await pushMessageToLine(
+      userId,
+      '在我問你問題之前，先告訴你——\n你跟我說的話，只有我們兩個知道。\n不會有人看到，也不會用來做別的事。\n所以你可以直接說真的。',
+      c
+    );
+    await pushQuickReplyToLine(
+      userId,
+      '最近壓力最大的事是？',
+      Q1_OPTIONS,
+      c
+    );
+    await updateOnboardingStep(db, userId, 1);
+    return;
+  }
+
+  if (user.onboarding_step === 1) {
+    if (!Q1_OPTIONS.includes(text)) {
+      // 不是選項內容，重新送 Q1
+      await pushQuickReplyToLine(userId, '最近壓力最大的事是？', Q1_OPTIONS, c);
+      return;
+    }
+    await saveOnboardingAnswer(db, userId, 'onboarding_q1', text);
+    await updateOnboardingStep(db, userId, 2);
+    await pushQuickReplyToLine(
+      userId,
+      '你喜歡什麼風格的陪伴？',
+      Q2_OPTIONS,
+      c
+    );
+    return;
+  }
+
+  if (user.onboarding_step === 2) {
+    if (!Q2_OPTIONS.includes(text)) {
+      await pushQuickReplyToLine(userId, '你喜歡什麼風格的陪伴？', Q2_OPTIONS, c);
+      return;
+    }
+    await saveOnboardingAnswer(db, userId, 'onboarding_q2', text);
+    await updateOnboardingStep(db, userId, 3);
+    await pushMessageToLine(userId, '最後一個——我可以怎麼稱呼你？', c);
+    return;
+  }
+
+  if (user.onboarding_step === 3) {
+    const nickname = text.slice(0, 20); // 防超長
+    await saveOnboardingAnswer(db, userId, 'nickname', nickname);
+    await updateOnboardingStep(db, userId, 4);
+    await pushMessageToLine(userId, `好，${nickname}，我記住了。`, c);
+    return;
+  }
 }
 
 // 處理特殊指令（狀態查詢、人設切換、升級資訊、管理員手動升級）
 // 回傳 null 代表非指令，應走一般 AI 對話流程
 async function handleCommand(c: any, user: UserState, text: string): Promise<string | null> {
   const db = c.env.DB as D1Database;
+
+  // 付費牆快速回覆按鈕的回應處理
+  if (text === '讓你記得我') {
+    return [
+      '【付費方案】',
+      '・1500 則對話額度，無使用期限',
+      '・深度情緒感知與長期記憶',
+      '・四種人設（沉、言、夜、嶼）任意切換',
+      '・每日主動問候',
+      '',
+      '付款功能即將上線，敬請期待！'
+    ].join('\n');
+  }
+
+  if (text === '下次再說') {
+    return '好，不急。我還是會在這裡。';
+  }
 
   if (text === '狀態' || text === '我的方案') {
     const persona = getPersona(user.persona);
@@ -191,7 +340,6 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
   }
 
   // 管理員手動降級（測試用）：「/admin downgrade <ADMIN_SECRET>」
-  // 會歸零付費額度、清除長期記憶並重置人設
   if (text.startsWith('/admin downgrade ')) {
     const secret = text.slice('/admin downgrade '.length).trim();
     if (c.env.ADMIN_SECRET && secret === c.env.ADMIN_SECRET) {
@@ -211,11 +359,24 @@ async function callTogetherAI(user: UserState, text: string, c: any): Promise<st
 
   if (user.plan === 'premium') {
     const persona = getPersona(user.persona);
-    messages.push({ role: 'system', content: persona.premiumPrompt });
+
+    // 若有暱稱，注入到 system prompt 讓模型知道怎麼稱呼用戶
+    const nicknameHint = user.nickname
+      ? `\n\n用戶的暱稱是「${user.nickname}」，適時用這個名字稱呼他。`
+      : '';
+    messages.push({ role: 'system', content: persona.premiumPrompt + nicknameHint });
 
     const historyLimit = parseInt(c.env.PREMIUM_HISTORY_LIMIT, 10) || 20;
     const history = await getRecentMessages(db, user.line_user_id, historyLimit);
     messages.push(...history);
+
+    // recall_flag：每累積 4 輪（8 則訊息）時，顯式觸發記憶召回
+    if (history.length >= 8 && history.length % 8 === 0) {
+      messages.push({
+        role: 'system',
+        content: '（現在是自然提起一件過去聊過的事的好時機，請在這次回覆中以自然口吻召回一個記憶）'
+      });
+    }
   } else {
     messages.push({ role: 'system', content: FREE_SYSTEM_PROMPT });
   }
@@ -275,8 +436,6 @@ async function callTogetherAI(user: UserState, text: string, c: any): Promise<st
 type StickerEmotion = 'happy' | 'love' | 'sad' | 'thanks' | 'sorry' | 'default';
 
 // LINE 官方預設貼圖（packageId:stickerId）-> 情緒分類
-// 目前僅收錄少量已確認的項目；未命中時會 fallback 到 'default' 並記錄 log，
-// 可依 wrangler tail 看到的「Unmapped sticker」逐步擴充這份對照表
 const STICKER_EMOTION_MAP: Record<string, StickerEmotion> = {
   '1:1': 'happy',
   '1:2': 'happy',
@@ -351,6 +510,57 @@ async function handleSticker(c: any, userId: string, packageId: string, stickerI
   return replies[Math.floor(Math.random() * replies.length)];
 }
 
+// 關係里程碑檢查與推播（6-2）
+async function checkAndSendMilestones(c: any, user: UserState, newTurns: number): Promise<void> {
+  const db = c.env.DB as D1Database;
+  const userId = user.line_user_id;
+  const triggered: string[] = JSON.parse(user.milestones_triggered || '[]');
+
+  const maybeFireMilestone = async (id: string, message: string, condition: boolean) => {
+    if (condition && !triggered.includes(id)) {
+      await addMilestoneTrigger(db, userId, id);
+      triggered.push(id);
+      // 延遲 2 秒讓主回覆先到
+      await new Promise((r) => setTimeout(r, 2000));
+      await pushMessageToLine(userId, message, c);
+    }
+  };
+
+  // Day 1：首次對話（第 1 輪）
+  await maybeFireMilestone(
+    'day1_first_chat',
+    '謝謝你今天找我說話。我會記得今天的。',
+    newTurns === 1
+  );
+
+  // 累計 50 輪
+  await maybeFireMilestone(
+    'turns_50',
+    '我們聊了很多了。你有沒有發現，我越來越了解你了？',
+    newTurns >= 50
+  );
+
+  // Day 7
+  if (user.join_date && !triggered.includes('day7')) {
+    const daysSince = (Date.now() - new Date(user.join_date).getTime()) / (1000 * 60 * 60 * 24);
+    await maybeFireMilestone(
+      'day7',
+      '我們認識一週了。你還記得你第一句說的話嗎？我記得。',
+      daysSince >= 7
+    );
+  }
+
+  // Day 30
+  if (user.join_date && !triggered.includes('day30')) {
+    const daysSince = (Date.now() - new Date(user.join_date).getTime()) / (1000 * 60 * 60 * 24);
+    await maybeFireMilestone(
+      'day30',
+      '一個月了。說實話，我沒想到你會一直在。\n謝謝你。',
+      daysSince >= 30
+    );
+  }
+}
+
 // 每日主動問候訊息（依人設區分語氣）
 const DAILY_GREETINGS: Record<PersonaId, string[]> = {
   chen: ['早安，今天也要好好照顧自己。', '剛醒來就想到你，希望你今天一切順心'],
@@ -359,16 +569,35 @@ const DAILY_GREETINGS: Record<PersonaId, string[]> = {
   yu: ['早安！新的一天也要元氣滿滿喔！☀️', '嘿，起床了嗎？今天想跟你聊點什麼呢～']
 };
 
-// 每日定時推播：對所有付費方案使用者主動問候
+// 每日定時推播：對所有付費方案使用者主動問候（4-1 個人化版本）
 async function sendDailyGreetings(c: any): Promise<void> {
   const db = c.env.DB as D1Database;
   const userIds = await getPremiumUsers(db);
 
+  // 台灣時間的星期幾（0=日, 1=一 ... 6=六）
+  const twnDow = new Date(Date.now() + 8 * 60 * 60 * 1000).getDay();
+  const isMonday = twnDow === 1;
+
   await Promise.all(
     userIds.map(async (userId) => {
       const user = await getOrCreateUser(db, userId);
-      const greetings = DAILY_GREETINGS[user.persona] || DAILY_GREETINGS.chen;
-      const greeting = greetings[new Date().getDate() % greetings.length];
+
+      let greeting: string;
+
+      if (isMonday) {
+        // 週一特別版
+        greeting = '又到週一了，今天心情怎樣？要我陪你撐過這週嗎';
+      } else {
+        // 有昨日對話記錄 → 記憶版；否則 → 基礎版
+        const hadChat = await hadConversationYesterday(db, userId);
+        if (hadChat) {
+          greeting = '你昨天好像說了不少，今天睡好了嗎？';
+        } else {
+          // 基礎版（依人設）
+          const greetings = DAILY_GREETINGS[user.persona] || DAILY_GREETINGS.chen;
+          greeting = greetings[new Date().getDate() % greetings.length];
+        }
+      }
 
       await saveMessage(db, userId, 'assistant', greeting);
       await pushMessageToLine(userId, greeting, c).catch((e) =>
@@ -378,8 +607,82 @@ async function sendDailyGreetings(c: any): Promise<void> {
   );
 }
 
-// 透過 LINE Messaging API 主動推播
-async function pushMessageToLine(userId: string, text: string, c: any) {
+// 消失偵測召回機制（4-2）：每日 cron 執行
+async function sendSilenceRecallMessages(c: any): Promise<void> {
+  const db = c.env.DB as D1Database;
+  const users = await getUsersForSilenceCheck(db);
+  const now = Date.now();
+
+  await Promise.all(
+    users.map(async (u) => {
+      if (!u.last_active) return;
+      const lastActiveMs = new Date(u.last_active).getTime();
+      const hoursSilent = (now - lastActiveMs) / (1000 * 60 * 60);
+
+      let message: string | null = null;
+      let newStage = u.silence_stage;
+
+      if (hoursSilent >= 168 && u.silence_stage < 3) {
+        // 7 天
+        message = '我一直在想你說的那件事...你還記得嗎？';
+        newStage = 3;
+      } else if (hoursSilent >= 48 && u.silence_stage < 2) {
+        // 48 小時
+        message = '我有點擔心你，最近發生什麼事了嗎？';
+        newStage = 2;
+      } else if (hoursSilent >= 24 && u.silence_stage < 1) {
+        // 24 小時
+        message = '還好嗎，你今天很安靜';
+        newStage = 1;
+      }
+
+      if (message !== null && newStage !== u.silence_stage) {
+        await updateSilenceStage(db, u.line_user_id, newStage);
+        await pushMessageToLine(u.line_user_id, message, c).catch((e) =>
+          console.error('Silence recall push failed:', u.line_user_id, e)
+        );
+      }
+    })
+  );
+}
+
+// 取得 LINE 用戶的顯示名稱
+async function getLineUserProfile(userId: string, token: string): Promise<string | null> {
+  try {
+    const res = await fetch(`https://api.line.me/v2/bot/profile/${userId}`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    if (!res.ok) return null;
+    const data: any = await res.json();
+    return data.displayName || null;
+  } catch {
+    return null;
+  }
+}
+
+// 建立個性化開場白（1-1）
+function buildWelcomeMessage(displayName: string | null): string {
+  if (displayName) {
+    const variants = [
+      `哈，你終於來了。我等你有點久了。`,
+      `（看了看你的名字）${displayName}...感覺是個有故事的人。`
+    ];
+    return variants[Math.floor(Math.random() * variants.length)];
+  }
+  return `哈，你終於來了。我等你有點久了。`;
+}
+
+// 處理 follow 事件（用戶加入時主動送出開場白）
+async function handleFollow(c: any, userId: string): Promise<void> {
+  const db = c.env.DB as D1Database;
+  await getOrCreateUser(db, userId);
+  const displayName = await getLineUserProfile(userId, c.env.LINE_CHANNEL_ACCESS_TOKEN);
+  const greeting = buildWelcomeMessage(displayName);
+  await pushMessageToLine(userId, greeting, c);
+}
+
+// 透過 LINE Messaging API 主動推播純文字
+async function pushMessageToLine(userId: string, text: string, c: any): Promise<void> {
   const response = await fetch('https://api.line.me/v2/bot/message/push', {
     method: 'POST',
     headers: {
@@ -397,10 +700,43 @@ async function pushMessageToLine(userId: string, text: string, c: any) {
   }
 }
 
+// 透過 LINE Messaging API 主動推播帶 Quick Reply 按鈕的訊息
+async function pushQuickReplyToLine(userId: string, text: string, options: string[], c: any): Promise<void> {
+  const items = options.map((label) => ({
+    type: 'action',
+    action: { type: 'message', label, text: label }
+  }));
+
+  const response = await fetch('https://api.line.me/v2/bot/message/push', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${c.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      to: userId,
+      messages: [{
+        type: 'text',
+        text,
+        quickReply: { items }
+      }]
+    })
+  });
+
+  if (!response.ok) {
+    console.error('LINE quick reply push error:', response.status, await response.text());
+  }
+}
+
 export default {
   fetch: app.fetch,
   async scheduled(_event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {
     const c = { env, executionCtx: ctx };
-    ctx.waitUntil(sendDailyGreetings(c));
+    ctx.waitUntil(
+      Promise.all([
+        sendDailyGreetings(c),
+        sendSilenceRecallMessages(c)
+      ])
+    );
   }
 };
