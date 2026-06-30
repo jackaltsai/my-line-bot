@@ -119,7 +119,7 @@ async function handleMessage(c: any, userId: string, text: string): Promise<stri
   // 新用戶第一則訊息：follow 事件沒觸發時的 fallback 開場白
   if (user.is_new) {
     // 抓不到 LINE 名稱也不該讓新客戶第一句就看到錯誤訊息：失敗就用空名走預設開場白
-    let displayName = '';
+    let displayName: string | null = '';
     try {
       displayName = await getLineUserProfile(userId, c.env.LINE_CHANNEL_ACCESS_TOKEN);
     } catch (e) {
