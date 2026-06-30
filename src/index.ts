@@ -118,7 +118,13 @@ async function handleMessage(c: any, userId: string, text: string): Promise<stri
 
   // 新用戶第一則訊息：follow 事件沒觸發時的 fallback 開場白
   if (user.is_new) {
-    const displayName = await getLineUserProfile(userId, c.env.LINE_CHANNEL_ACCESS_TOKEN);
+    // 抓不到 LINE 名稱也不該讓新客戶第一句就看到錯誤訊息：失敗就用空名走預設開場白
+    let displayName = '';
+    try {
+      displayName = await getLineUserProfile(userId, c.env.LINE_CHANNEL_ACCESS_TOKEN);
+    } catch (e) {
+      console.error('[welcome] getLineUserProfile failed, using default greeting:', e);
+    }
     return buildWelcomeMessage(displayName);
   }
 
@@ -186,6 +192,21 @@ async function processNormalMessage(c: any, user: UserState, text: string): Prom
   return reply;
 }
 
+// 對外部呼叫（LINE 推播 / D1 寫入）重試一次；最終失敗只記 log、不拋例外。
+// 避免 onboarding 任一步驟出錯就讓客戶看到「我現在沒辦法思考」。
+async function resilient(label: string, fn: () => Promise<void>): Promise<void> {
+  try {
+    await fn();
+  } catch (e) {
+    console.error(`[onboarding] ${label} failed, retrying once:`, e);
+    try {
+      await fn();
+    } catch (e2) {
+      console.error(`[onboarding] ${label} retry failed:`, e2);
+    }
+  }
+}
+
 // Onboarding 狀態機（1-2）
 // step 0: 剛加入，顯示隱私承諾 + Q1
 // step 1: 等待 Q1 答案 → 存 q1，顯示 Q2
@@ -197,54 +218,44 @@ async function handleOnboarding(c: any, user: UserState, text: string): Promise<
 
   if (user.onboarding_step === 0) {
     // 隱私承諾（6-1）+ Q1
-    await pushMessageToLine(
+    await resilient('privacy-promise', () => pushMessageToLine(
       userId,
       '在我問你問題之前，先告訴你——\n你跟我說的話，只有我們兩個知道。\n不會有人看到，也不會用來做別的事。\n所以你可以直接說真的。',
       c
-    );
-    await pushQuickReplyToLine(
-      userId,
-      '最近壓力最大的事是？',
-      Q1_OPTIONS,
-      c
-    );
-    await updateOnboardingStep(db, userId, 1);
+    ));
+    await resilient('Q1', () => pushQuickReplyToLine(userId, '最近壓力最大的事是？', Q1_OPTIONS, c));
+    await resilient('step→1', () => updateOnboardingStep(db, userId, 1));
     return;
   }
 
   if (user.onboarding_step === 1) {
     if (!Q1_OPTIONS.includes(text)) {
       // 不是選項內容，重新送 Q1
-      await pushQuickReplyToLine(userId, '最近壓力最大的事是？', Q1_OPTIONS, c);
+      await resilient('Q1-reprompt', () => pushQuickReplyToLine(userId, '最近壓力最大的事是？', Q1_OPTIONS, c));
       return;
     }
-    await saveOnboardingAnswer(db, userId, 'onboarding_q1', text);
-    await updateOnboardingStep(db, userId, 2);
-    await pushQuickReplyToLine(
-      userId,
-      '你喜歡什麼風格的陪伴？',
-      Q2_OPTIONS,
-      c
-    );
+    await resilient('save-q1', () => saveOnboardingAnswer(db, userId, 'onboarding_q1', text));
+    await resilient('step→2', () => updateOnboardingStep(db, userId, 2));
+    await resilient('Q2', () => pushQuickReplyToLine(userId, '你喜歡什麼風格的陪伴？', Q2_OPTIONS, c));
     return;
   }
 
   if (user.onboarding_step === 2) {
     if (!Q2_OPTIONS.includes(text)) {
-      await pushQuickReplyToLine(userId, '你喜歡什麼風格的陪伴？', Q2_OPTIONS, c);
+      await resilient('Q2-reprompt', () => pushQuickReplyToLine(userId, '你喜歡什麼風格的陪伴？', Q2_OPTIONS, c));
       return;
     }
-    await saveOnboardingAnswer(db, userId, 'onboarding_q2', text);
-    await updateOnboardingStep(db, userId, 3);
-    await pushMessageToLine(userId, '最後一個——我可以怎麼稱呼你？', c);
+    await resilient('save-q2', () => saveOnboardingAnswer(db, userId, 'onboarding_q2', text));
+    await resilient('step→3', () => updateOnboardingStep(db, userId, 3));
+    await resilient('Q3', () => pushMessageToLine(userId, '最後一個——我可以怎麼稱呼你？', c));
     return;
   }
 
   if (user.onboarding_step === 3) {
     const nickname = text.slice(0, 20); // 防超長
-    await saveOnboardingAnswer(db, userId, 'nickname', nickname);
-    await updateOnboardingStep(db, userId, 4);
-    await pushMessageToLine(userId, `好，${nickname}，我記住了。`, c);
+    await resilient('save-nickname', () => saveOnboardingAnswer(db, userId, 'nickname', nickname));
+    await resilient('step→4', () => updateOnboardingStep(db, userId, 4));
+    await resilient('confirm', () => pushMessageToLine(userId, `好，${nickname}，我記住了。`, c));
     return;
   }
 }
