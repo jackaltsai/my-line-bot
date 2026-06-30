@@ -352,7 +352,8 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
   return null;
 }
 
-// 單次 Together AI 請求，回傳剝除 <think> 後的內容；失敗或空內容時回傳 null
+// 單次 Together AI 請求（一律串流，相容「只支援串流」的模型）。
+// 逐塊累積 delta.content，組成完整內容後回傳；失敗或空內容回傳 null。
 async function fetchTogetherAI(
   messages: { role: string; content: string }[],
   model: string,
@@ -371,7 +372,9 @@ async function fetchTogetherAI(
         messages,
         temperature: 0.8,
         chat_template_kwargs: { enable_thinking: false },
-        max_tokens: 8192
+        max_tokens: 8192,
+        stream: true,
+        stream_options: { include_usage: true } // 串流模式下仍能拿到 token 用量
       })
     });
   } catch (e) {
@@ -383,18 +386,62 @@ async function fetchTogetherAI(
     console.error('Together AI error:', response.status, await response.text());
     return null;
   }
-
-  const data: any = await response.json();
-  const content: string = (data.choices?.[0]?.message?.content || '')
-    .replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-
-  if (!content) {
-    const finishReason = data.choices?.[0]?.finish_reason;
-    console.error(`Together AI empty content (finish_reason: ${finishReason}), raw:`, JSON.stringify(data).slice(0, 2000));
+  if (!response.body) {
+    console.error('Together AI streaming: no response body');
     return null;
   }
 
-  return { content, usage: data.usage };
+  // 解析 SSE：逐行累積 delta.content，並抓最後一塊的 usage
+  let raw = '';
+  let usage: any = null;
+  let finishReason: string | null = null;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // 以換行切分，最後一段可能不完整，留到下一輪
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const payload = trimmed.slice(5).trim();
+        if (payload === '' || payload === '[DONE]') continue;
+
+        let chunk: any;
+        try {
+          chunk = JSON.parse(payload);
+        } catch {
+          continue; // 非完整 JSON 的行，略過
+        }
+
+        const delta = chunk.choices?.[0]?.delta;
+        if (delta?.content) raw += delta.content;
+        if (chunk.choices?.[0]?.finish_reason) finishReason = chunk.choices[0].finish_reason;
+        if (chunk.usage) usage = chunk.usage;
+      }
+    }
+  } catch (e) {
+    console.error('Together AI streaming read error:', e);
+    return null;
+  }
+
+  // reasoning 模型仍可能夾帶 <think>，一律剝除
+  const content = raw.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+
+  if (!content) {
+    console.error(`Together AI empty content (finish_reason: ${finishReason}), raw length: ${raw.length}`);
+    return null;
+  }
+
+  return { content, usage };
 }
 
 // 呼叫 Together AI Chat Completions API，失敗時自動重試一次（換備用模型）
@@ -430,7 +477,7 @@ async function callTogetherAI(user: UserState, text: string, c: any): Promise<st
 
   // 雙模型分級：免費用快速小模型省成本，付費用大模型提升品質
   const primaryModel = user.plan === 'premium'
-    ? (c.env.TOGETHER_MODEL_PREMIUM || c.env.TOGETHER_MODEL || 'Qwen/Qwen3.5-397B-A17B')
+    ? (c.env.TOGETHER_MODEL_PREMIUM || c.env.TOGETHER_MODEL || 'Qwen/Qwen3.7-Max')
     : (c.env.TOGETHER_MODEL_FREE || 'Qwen/Qwen2.5-7B-Instruct-Turbo');
 
   // 備用模型：主模型失敗時 fallback，避免客戶看到錯誤訊息
