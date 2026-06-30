@@ -5,6 +5,7 @@ import {
   addMilestoneTrigger,
   consumeQuota,
   downgradeToFree,
+  getNewFreeUsers,
   getOrCreateUser,
   getPremiumUsers,
   getRecentMessages,
@@ -674,6 +675,21 @@ async function sendDailyGreetings(c: any): Promise<void> {
       await saveMessage(db, userId, 'assistant', greeting);
       await pushMessageToLine(userId, greeting, c).catch((e) =>
         console.error('Daily greeting push failed:', userId, e)
+      );
+    })
+  );
+
+  // 免費方案：只對「加入未滿 7 天、已完成 onboarding」的新客戶送基礎早安。
+  // 限量推播控制成本，且不送記憶/週一特別版，保留付費差異化。
+  const freeUserIds = await getNewFreeUsers(db);
+  await Promise.all(
+    freeUserIds.map(async (userId) => {
+      const user = await getOrCreateUser(db, userId);
+      const greetings = DAILY_GREETINGS[user.persona] || DAILY_GREETINGS.chen;
+      const greeting = greetings[new Date().getDate() % greetings.length];
+      // 免費方案無長期記憶，不寫入 messages，只推播
+      await pushMessageToLine(userId, greeting, c).catch((e) =>
+        console.error('Free daily greeting push failed:', userId, e)
       );
     })
   );
