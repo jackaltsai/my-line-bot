@@ -184,6 +184,21 @@ export async function getPremiumUsers(db: D1Database): Promise<string[]> {
   return (results || []).map((r) => r.line_user_id);
 }
 
+// 取得「近 7 天內加入、且已完成 onboarding」的免費方案使用者（每日問候的限量對象）。
+// 加入滿 7 天後付費牆會觸發，這些客戶就不再收到每日問候 → 控制推播成本、保留付費誘因。
+export async function getNewFreeUsers(db: D1Database): Promise<string[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT line_user_id FROM users
+       WHERE plan = 'free'
+         AND onboarding_step >= 4
+         AND join_date > date('now', '+8 hours', '-7 days')`
+    )
+    .all<{ line_user_id: string }>();
+
+  return (results || []).map((r) => r.line_user_id);
+}
+
 // 更新 onboarding 進度步驟
 export async function updateOnboardingStep(db: D1Database, lineUserId: string, step: number): Promise<void> {
   await db
