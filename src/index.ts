@@ -257,7 +257,7 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
   if (text === '讓你記得我') {
     return [
       '【付費方案】',
-      '・1500 則對話額度，無使用期限',
+      '・500 則對話額度，無使用期限',
       '・深度情緒感知與長期記憶',
       '・四種人設（沉、言、夜、嶼）任意切換',
       '・每日主動問候',
@@ -298,7 +298,7 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
   if (text === '升級' || text === '付費' || text === '付費方案') {
     return [
       '【付費方案】',
-      '・1500 則對話額度，無使用期限',
+      '・500 則對話額度，無使用期限',
       '・深度情緒感知與長期記憶',
       '・四種人設（沉、言、夜、嶼）任意切換',
       '・每日主動問候',
@@ -312,7 +312,7 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
     const secret = text.slice('/admin upgrade '.length).trim();
     if (c.env.ADMIN_SECRET && secret === c.env.ADMIN_SECRET) {
       await upgradeToPremium(db, user.line_user_id);
-      return '已升級為付費方案，獲得 1500 則對話額度！輸入「人設」可切換喜歡的人設 💛';
+      return '已升級為付費方案，獲得 500 則對話額度！輸入「人設」可切換喜歡的人設 💛';
     }
     return null;
   }
