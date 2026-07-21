@@ -306,6 +306,7 @@ export interface OrderRow {
   amount: number;
   status: 'pending' | 'paid' | 'cancelled';
   transaction_id: string;
+  created_at: string;
 }
 
 // 建立待付款訂單（LINE Pay Request 前）
@@ -319,7 +320,7 @@ export async function createOrder(db: D1Database, orderId: string, lineUserId: s
 // 取得訂單
 export async function getOrder(db: D1Database, orderId: string): Promise<OrderRow | null> {
   const row = await db
-    .prepare('SELECT order_id, line_user_id, amount, status, transaction_id FROM orders WHERE order_id = ?')
+    .prepare('SELECT order_id, line_user_id, amount, status, transaction_id, created_at FROM orders WHERE order_id = ?')
     .bind(orderId)
     .first<OrderRow>();
   return row || null;
@@ -349,10 +350,10 @@ export async function markOrderCancelled(db: D1Database, orderId: string): Promi
     .run();
 }
 
-// 取得已建立 LINE Pay 交易但尚未確認付款的訂單（備援：瀏覽器沒有自動導回 confirmUrl 時手動補確認用）
+// 取得已建立 LINE Pay 交易但尚未確認付款的訂單（備援：瀏覽器沒有自動導回 confirmUrl 時補確認用）
 export async function getPendingOrdersWithTransaction(db: D1Database): Promise<OrderRow[]> {
   const { results } = await db
-    .prepare(`SELECT order_id, line_user_id, amount, status, transaction_id FROM orders
+    .prepare(`SELECT order_id, line_user_id, amount, status, transaction_id, created_at FROM orders
               WHERE status = 'pending' AND transaction_id != ''`)
     .all<OrderRow>();
   return results || [];

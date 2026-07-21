@@ -430,29 +430,13 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
     return null;
   }
 
-  // 管理員手動同步訂單（備援）：LINE Pay 付款完成後若瀏覽器沒有自動導回 confirmUrl，
-  // 用這個指令手動對待確認訂單補呼叫 Confirm API：「/admin sync-orders <ADMIN_SECRET>」
+  // 管理員手動同步訂單：立即觸發一次 syncPendingOrders（平常由 cron 每 5 分鐘自動跑，這裡是手動測試/急件用）
+  // 「/admin sync-orders <ADMIN_SECRET>」
   if (text.startsWith('/admin sync-orders ')) {
     const secret = text.slice('/admin sync-orders '.length).trim();
     if (c.env.ADMIN_SECRET && secret === c.env.ADMIN_SECRET) {
-      const pending = await getPendingOrdersWithTransaction(db);
-      let paid = 0;
-      for (const order of pending) {
-        const result = await confirmLinePayPayment(c.env, order.transaction_id, order.amount);
-        if (result.ok) {
-          await markOrderPaid(db, order.order_id);
-          await upgradeToPremium(db, order.line_user_id, PREMIUM_CREDITS_GRANT);
-          await pushMessageToLine(
-            order.line_user_id,
-            `付款完成！已升級為付費方案，獲得 ${PREMIUM_CREDITS_GRANT} 則對話額度！輸入「人設」可切換喜歡的人設 💛`,
-            c
-          );
-          paid++;
-        } else {
-          console.error('sync-orders confirm failed:', order.order_id, result.returnCode, result.returnMessage);
-        }
-      }
-      return `同步完成：${pending.length} 筆待處理訂單，成功確認 ${paid} 筆。`;
+      const summary = await syncPendingOrders(c);
+      return `同步完成：${summary.total} 筆待處理訂單，成功確認 ${summary.paid} 筆，已取消 ${summary.cancelled} 筆過期訂單。`;
     }
     return null;
   }
@@ -506,6 +490,42 @@ async function triggerPremiumPurchase(c: any, userId: string): Promise<void> {
     result.paymentUrl,
     c
   );
+}
+
+// 訂單超過這個時間仍無法確認付款，視為過期並取消（避免每次同步都重試永遠失敗的舊訂單）
+const ORDER_EXPIRY_MS = 24 * 60 * 60 * 1000;
+
+// 對所有待確認訂單補呼叫 LINE Pay Confirm API（實測發現 LINE 內建瀏覽器不一定會自動導回
+// confirmUrl，所以不能只靠瀏覽器導回這條路徑，改由 cron 定期主動同步，管理員指令也共用這支）
+async function syncPendingOrders(c: any): Promise<{ total: number; paid: number; cancelled: number }> {
+  const db = c.env.DB as D1Database;
+  const pending = await getPendingOrdersWithTransaction(db);
+  let paid = 0;
+  let cancelled = 0;
+
+  for (const order of pending) {
+    const result = await confirmLinePayPayment(c.env, order.transaction_id, order.amount);
+    if (result.ok) {
+      await markOrderPaid(db, order.order_id);
+      await upgradeToPremium(db, order.line_user_id, PREMIUM_CREDITS_GRANT);
+      await pushMessageToLine(
+        order.line_user_id,
+        `付款完成！已升級為付費方案，獲得 ${PREMIUM_CREDITS_GRANT} 則對話額度！輸入「人設」可切換喜歡的人設 💛`,
+        c
+      );
+      paid++;
+      continue;
+    }
+
+    console.error('syncPendingOrders confirm failed:', order.order_id, result.returnCode, result.returnMessage);
+    const ageMs = Date.now() - new Date(order.created_at + 'Z').getTime();
+    if (ageMs > ORDER_EXPIRY_MS) {
+      await markOrderCancelled(db, order.order_id);
+      cancelled++;
+    }
+  }
+
+  return { total: pending.length, paid, cancelled };
 }
 
 // 單次 Together AI 請求（一律串流，相容「只支援串流」的模型）。
@@ -985,8 +1005,16 @@ async function pushButtonToLine(userId: string, text: string, buttonLabel: strin
 
 export default {
   fetch: app.fetch,
-  async scheduled(_event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {
+  async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {
     const c = { env, executionCtx: ctx };
+
+    // 每 5 分鐘：同步 LINE Pay 待確認訂單（因為導回 confirmUrl 不可靠，這是主要的確認機制）
+    if (event.cron === '*/5 * * * *') {
+      ctx.waitUntil(syncPendingOrders(c));
+      return;
+    }
+
+    // 每天 01:00 UTC：每日問候 + 消失偵測召回
     ctx.waitUntil(
       Promise.all([
         sendDailyGreetings(c),
