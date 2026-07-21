@@ -51,9 +51,24 @@ async function linePayFetch(
     body: requestBody
   });
 
-  const data: any = await res.json();
+  // transactionId 是 19 位數的大整數，超過 JS number 精確表示範圍，
+  // 用 res.json() 解析會被四捨五入導致數值錯誤，所以先從原始文字用正規表達式取出字串形式
+  const text = await res.text();
+  let data: any;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    console.error('LINE Pay API non-JSON response:', uri, res.status, text);
+    return { returnCode: 'PARSE_ERROR', returnMessage: text };
+  }
+
+  const rawTransactionId = text.match(/"transactionId"\s*:\s*(\d+)/)?.[1];
+  if (rawTransactionId) {
+    data.transactionIdRaw = rawTransactionId;
+  }
+
   if (!res.ok || data.returnCode !== '0000') {
-    console.error('LINE Pay API error:', uri, res.status, JSON.stringify(data));
+    console.error('LINE Pay API error:', uri, res.status, text);
   }
   return data;
 }
@@ -96,7 +111,7 @@ export async function createLinePayRequest(
   return {
     ok: true,
     paymentUrl: data.info?.paymentUrl?.web,
-    transactionId: String(data.info?.transactionId)
+    transactionId: data.transactionIdRaw || String(data.info?.transactionId)
   };
 }
 
