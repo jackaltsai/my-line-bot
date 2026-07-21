@@ -349,6 +349,15 @@ export async function markOrderCancelled(db: D1Database, orderId: string): Promi
     .run();
 }
 
+// 取得已建立 LINE Pay 交易但尚未確認付款的訂單（備援：瀏覽器沒有自動導回 confirmUrl 時手動補確認用）
+export async function getPendingOrdersWithTransaction(db: D1Database): Promise<OrderRow[]> {
+  const { results } = await db
+    .prepare(`SELECT order_id, line_user_id, amount, status, transaction_id FROM orders
+              WHERE status = 'pending' AND transaction_id != ''`)
+    .all<OrderRow>();
+  return results || [];
+}
+
 export interface UsageSummaryRow {
   model: string;
   requests: number;

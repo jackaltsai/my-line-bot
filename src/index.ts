@@ -10,6 +10,7 @@ import {
   downgradeToFree,
   getOrCreateUser,
   getOrder,
+  getPendingOrdersWithTransaction,
   getPremiumUsers,
   getRecentMessages,
   getUsageSummary,
@@ -425,6 +426,33 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
               .join('\n');
 
       return `【今日用量（UTC）】\n${format(todayRows)}\n\n【累計用量】\n${format(totalRows)}`;
+    }
+    return null;
+  }
+
+  // 管理員手動同步訂單（備援）：LINE Pay 付款完成後若瀏覽器沒有自動導回 confirmUrl，
+  // 用這個指令手動對待確認訂單補呼叫 Confirm API：「/admin sync-orders <ADMIN_SECRET>」
+  if (text.startsWith('/admin sync-orders ')) {
+    const secret = text.slice('/admin sync-orders '.length).trim();
+    if (c.env.ADMIN_SECRET && secret === c.env.ADMIN_SECRET) {
+      const pending = await getPendingOrdersWithTransaction(db);
+      let paid = 0;
+      for (const order of pending) {
+        const result = await confirmLinePayPayment(c.env, order.transaction_id, order.amount);
+        if (result.ok) {
+          await markOrderPaid(db, order.order_id);
+          await upgradeToPremium(db, order.line_user_id, PREMIUM_CREDITS_GRANT);
+          await pushMessageToLine(
+            order.line_user_id,
+            `付款完成！已升級為付費方案，獲得 ${PREMIUM_CREDITS_GRANT} 則對話額度！輸入「人設」可切換喜歡的人設 💛`,
+            c
+          );
+          paid++;
+        } else {
+          console.error('sync-orders confirm failed:', order.order_id, result.returnCode, result.returnMessage);
+        }
+      }
+      return `同步完成：${pending.length} 筆待處理訂單，成功確認 ${paid} 筆。`;
     }
     return null;
   }
