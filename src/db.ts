@@ -2,6 +2,7 @@ import type { PersonaId } from './personas';
 
 export const FREE_DAILY_LIMIT = 10;
 export const PREMIUM_CREDITS_GRANT = 500;
+export const PREMIUM_PRICE_TWD = 299;
 
 export interface UserState {
   line_user_id: string;
@@ -296,6 +297,55 @@ export async function logUsage(
   await db
     .prepare('INSERT INTO usage_log (line_user_id, plan, model, prompt_tokens, completion_tokens) VALUES (?, ?, ?, ?, ?)')
     .bind(lineUserId, plan, model, promptTokens, completionTokens)
+    .run();
+}
+
+export interface OrderRow {
+  order_id: string;
+  line_user_id: string;
+  amount: number;
+  status: 'pending' | 'paid' | 'cancelled';
+  transaction_id: string;
+}
+
+// 建立待付款訂單（LINE Pay Request 前）
+export async function createOrder(db: D1Database, orderId: string, lineUserId: string, amount: number): Promise<void> {
+  await db
+    .prepare(`INSERT INTO orders (order_id, line_user_id, amount, status) VALUES (?, ?, ?, 'pending')`)
+    .bind(orderId, lineUserId, amount)
+    .run();
+}
+
+// 取得訂單
+export async function getOrder(db: D1Database, orderId: string): Promise<OrderRow | null> {
+  const row = await db
+    .prepare('SELECT order_id, line_user_id, amount, status, transaction_id FROM orders WHERE order_id = ?')
+    .bind(orderId)
+    .first<OrderRow>();
+  return row || null;
+}
+
+// 記錄 LINE Pay Request API 回傳的 transactionId
+export async function setOrderTransactionId(db: D1Database, orderId: string, transactionId: string): Promise<void> {
+  await db
+    .prepare(`UPDATE orders SET transaction_id = ?, updated_at = datetime('now') WHERE order_id = ?`)
+    .bind(transactionId, orderId)
+    .run();
+}
+
+// 標記訂單付款成功
+export async function markOrderPaid(db: D1Database, orderId: string): Promise<void> {
+  await db
+    .prepare(`UPDATE orders SET status = 'paid', updated_at = datetime('now') WHERE order_id = ?`)
+    .bind(orderId)
+    .run();
+}
+
+// 標記訂單已取消
+export async function markOrderCancelled(db: D1Database, orderId: string): Promise<void> {
+  await db
+    .prepare(`UPDATE orders SET status = 'cancelled', updated_at = datetime('now') WHERE order_id = ?`)
+    .bind(orderId)
     .run();
 }
 

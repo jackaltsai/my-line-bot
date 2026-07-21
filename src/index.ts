@@ -2,10 +2,14 @@ import { Hono } from 'hono';
 import { validateSignature } from '@line/bot-sdk';
 import {
   FREE_DAILY_LIMIT,
+  PREMIUM_CREDITS_GRANT,
+  PREMIUM_PRICE_TWD,
   addMilestoneTrigger,
   consumeQuota,
+  createOrder,
   downgradeToFree,
   getOrCreateUser,
+  getOrder,
   getPremiumUsers,
   getRecentMessages,
   getUsageSummary,
@@ -14,9 +18,12 @@ import {
   hasQuota,
   incrementTotalTurns,
   logUsage,
+  markOrderCancelled,
+  markOrderPaid,
   markPaywallTriggered,
   saveMessage,
   saveOnboardingAnswer,
+  setOrderTransactionId,
   setPersona,
   updateLastActive,
   updateOnboardingStep,
@@ -25,6 +32,7 @@ import {
   type UserState
 } from './db';
 import { FREE_SYSTEM_PROMPT, PERSONAS, getPersona, type PersonaId } from './personas';
+import { confirmLinePayPayment, createLinePayRequest } from './linepay';
 import * as OpenCC from 'opencc-js';
 
 // 簡轉繁保險：模型偶爾仍會漏出簡體字，統一在輸出前轉換成台灣正體
@@ -39,6 +47,10 @@ type Bindings = {
   TOGETHER_MODEL_PREMIUM: string;
   PREMIUM_HISTORY_LIMIT: string;
   ADMIN_SECRET: string;
+  LINE_PAY_CHANNEL_ID: string;
+  LINE_PAY_CHANNEL_SECRET: string;
+  LINE_PAY_ENV: string; // 'sandbox' | 'production'
+  APP_BASE_URL: string; // 例如 https://my-line-bot.xxx.workers.dev，用於組出 LINE Pay confirm/cancel 網址
   DB: D1Database;
 };
 
@@ -102,6 +114,17 @@ app.post('/webhook', async (c) => {
         } catch (err) {
           console.error('Sticker handling failed:', err);
         }
+      } else if (event.type === 'postback') {
+        const userId = event.source.userId;
+
+        try {
+          await handlePostback(c, userId, event.postback?.data || '');
+        } catch (err) {
+          console.error('Postback handling failed:', err);
+          await pushMessageToLine(userId, '付款連結產生失敗，請稍後再試一次 🙏', c).catch((e) =>
+            console.error('Fallback push failed:', e)
+          );
+        }
       }
     }))
   );
@@ -109,6 +132,67 @@ app.post('/webhook', async (c) => {
   // 2. 立即回應 LINE，避免超時
   return c.json({ status: 'success' });
 });
+
+// LINE Pay 付款完成後導回：確認付款並升級為付費方案
+app.get('/payment/confirm', async (c) => {
+  const orderId = c.req.query('orderId');
+  const transactionId = c.req.query('transactionId');
+  if (!orderId || !transactionId) {
+    return c.html(paymentResultPage('付款資料不完整，請重新操作。'), 400);
+  }
+
+  const db = c.env.DB as D1Database;
+  const order = await getOrder(db, orderId);
+  if (!order || order.status !== 'pending') {
+    return c.html(paymentResultPage('找不到這筆訂單，或已經處理過了。'), 400);
+  }
+
+  const result = await confirmLinePayPayment(c.env, transactionId, order.amount);
+  if (!result.ok) {
+    console.error('LINE Pay confirm failed:', result.returnCode, result.returnMessage);
+    return c.html(paymentResultPage('付款確認失敗，請稍後再試或聯繫客服。'), 400);
+  }
+
+  await markOrderPaid(db, orderId);
+  await upgradeToPremium(db, order.line_user_id, PREMIUM_CREDITS_GRANT);
+  await pushMessageToLine(
+    order.line_user_id,
+    `付款完成！已升級為付費方案，獲得 ${PREMIUM_CREDITS_GRANT} 則對話額度！輸入「人設」可切換喜歡的人設 💛`,
+    c
+  );
+
+  return c.html(paymentResultPage('付款成功！請回到 LINE 聊天室查看升級通知 💛'));
+});
+
+// LINE Pay 付款取消導回
+app.get('/payment/cancel', async (c) => {
+  const orderId = c.req.query('orderId');
+  const db = c.env.DB as D1Database;
+  if (orderId) {
+    await markOrderCancelled(db, orderId);
+  }
+  return c.html(paymentResultPage('已取消付款，隨時可以再回來升級喔。'));
+});
+
+// 付款結果的簡易確認頁（給 LINE Pay confirmUrl/cancelUrl 導回顯示用）
+function paymentResultPage(message: string): string {
+  return `<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>心辰付費方案</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f5f5f5; }
+  .card { text-align: center; padding: 32px; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); max-width: 320px; }
+  p { color: #333; line-height: 1.6; }
+</style>
+</head>
+<body>
+  <div class="card"><p>${message}</p></div>
+</body>
+</html>`;
+}
 
 // handleMessage 回傳 null 代表已由內部處理（onboarding 多訊息推播），不需外層再 push
 async function handleMessage(c: any, userId: string, text: string): Promise<string | null> {
@@ -350,6 +434,40 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
   }
 
   return null;
+}
+
+// 處理圖文選單「立即購買」的 Postback：建立訂單並透過 LINE Pay 產生付款連結
+async function handlePostback(c: any, userId: string, data: string): Promise<void> {
+  const params = new URLSearchParams(data);
+  if (params.get('action') !== 'buy_premium') return;
+
+  const db = c.env.DB as D1Database;
+  const orderId = crypto.randomUUID();
+  await createOrder(db, orderId, userId, PREMIUM_PRICE_TWD);
+
+  const baseUrl = c.env.APP_BASE_URL as string;
+  const result = await createLinePayRequest(c.env, {
+    orderId,
+    amount: PREMIUM_PRICE_TWD,
+    productName: `心辰付費方案 - ${PREMIUM_CREDITS_GRANT}則對話額度`,
+    confirmUrl: `${baseUrl}/payment/confirm?orderId=${orderId}`,
+    cancelUrl: `${baseUrl}/payment/cancel?orderId=${orderId}`
+  });
+
+  if (!result.ok || !result.paymentUrl) {
+    console.error('LINE Pay request failed:', result.returnCode, result.returnMessage);
+    await pushMessageToLine(userId, '付款連結產生失敗，請稍後再試一次 🙏', c);
+    return;
+  }
+
+  await setOrderTransactionId(db, orderId, result.transactionId || '');
+  await pushButtonToLine(
+    userId,
+    `【心辰付費方案】NT$${PREMIUM_PRICE_TWD}\n・${PREMIUM_CREDITS_GRANT} 則對話額度，無使用期限\n・深度情緒感知與長期記憶\n・四種人設任意切換\n・每日主動問候`,
+    '立即付款',
+    result.paymentUrl,
+    c
+  );
 }
 
 // 單次 Together AI 請求（一律串流，相容「只支援串流」的模型）。
@@ -797,6 +915,33 @@ async function pushQuickReplyToLine(userId: string, text: string, options: strin
 
   if (!response.ok) {
     console.error('LINE quick reply push error:', response.status, await response.text());
+  }
+}
+
+// 透過 LINE Messaging API 推播帶「開啟連結」按鈕的訊息（Buttons Template）
+async function pushButtonToLine(userId: string, text: string, buttonLabel: string, url: string, c: any): Promise<void> {
+  const response = await fetch('https://api.line.me/v2/bot/message/push', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${c.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      to: userId,
+      messages: [{
+        type: 'template',
+        altText: text,
+        template: {
+          type: 'buttons',
+          text: text.slice(0, 160), // Buttons template 文字上限 160 字
+          actions: [{ type: 'uri', label: buttonLabel, uri: url }]
+        }
+      }]
+    })
+  });
+
+  if (!response.ok) {
+    console.error('LINE button push error:', response.status, await response.text());
   }
 }
 

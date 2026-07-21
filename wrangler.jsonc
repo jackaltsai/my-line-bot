@@ -27,10 +27,13 @@
 			"database_name": "my-line-bot-db",
 			"database_id": "804c53b2-3aea-4222-9ee5-77da7c217cc6"
 		}
-	]
-	// "vars": {
-	//   "MY_VAR": "my-variable"
-	// },
+	],
+	"vars": {
+		// LINE Pay 環境："sandbox"（測試）或 "production"（正式，通過商家審核後改這個）
+		"LINE_PAY_ENV": "sandbox",
+		// 部署後的 Worker 網址，用來組出 LINE Pay confirmUrl/cancelUrl（例如 https://my-line-bot.xxx.workers.dev），請改成實際網址
+		"APP_BASE_URL": "https://my-line-bot.example.workers.dev"
+	}
 	// "kv_namespaces": [
 	//   {
 	//     "binding": "MY_KV_NAMESPACE",
