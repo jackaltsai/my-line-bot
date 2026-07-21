@@ -214,6 +214,12 @@ async function handleMessage(c: any, userId: string, text: string): Promise<stri
     return null;
   }
 
+  // 圖文選單「立即購買」（文字類型動作）觸發購買流程
+  if (text === '立即購買') {
+    await triggerPremiumPurchase(c, userId);
+    return null;
+  }
+
   // 付費牆觸發檢查：免費方案使用滿 7 天且尚未觸發
   if (user.plan === 'free' && !user.paywall_triggered && user.join_date) {
     const joinTs = new Date(user.join_date).getTime();
@@ -436,11 +442,15 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
   return null;
 }
 
-// 處理圖文選單「立即購買」的 Postback：建立訂單並透過 LINE Pay 產生付款連結
+// 處理圖文選單「立即購買」的 Postback（若之後改用 Messaging API 建立圖文選單才會觸發）
 async function handlePostback(c: any, userId: string, data: string): Promise<void> {
   const params = new URLSearchParams(data);
   if (params.get('action') !== 'buy_premium') return;
+  await triggerPremiumPurchase(c, userId);
+}
 
+// 建立訂單並透過 LINE Pay 產生付款連結，推播「立即付款」按鈕給使用者
+async function triggerPremiumPurchase(c: any, userId: string): Promise<void> {
   const db = c.env.DB as D1Database;
   const orderId = crypto.randomUUID();
   await createOrder(db, orderId, userId, PREMIUM_PRICE_TWD);
