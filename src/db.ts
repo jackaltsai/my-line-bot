@@ -299,6 +299,15 @@ export async function logUsage(
     .run();
 }
 
+// 標記 Stripe webhook 事件為已處理；回傳是否為首次處理（INSERT OR IGNORE 確保去重是原子操作）
+export async function markStripeEventProcessed(db: D1Database, eventId: string): Promise<boolean> {
+  const result = await db
+    .prepare('INSERT OR IGNORE INTO stripe_events (event_id) VALUES (?)')
+    .bind(eventId)
+    .run();
+  return (result.meta.changes ?? 0) > 0;
+}
+
 export interface UsageSummaryRow {
   model: string;
   requests: number;

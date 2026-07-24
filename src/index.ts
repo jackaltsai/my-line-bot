@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { validateSignature } from '@line/bot-sdk';
+import Stripe from 'stripe';
 import {
   FREE_DAILY_LIMIT,
   addMilestoneTrigger,
@@ -15,6 +16,7 @@ import {
   incrementTotalTurns,
   logUsage,
   markPaywallTriggered,
+  markStripeEventProcessed,
   saveMessage,
   saveOnboardingAnswer,
   setPersona,
@@ -39,6 +41,11 @@ type Bindings = {
   TOGETHER_MODEL_PREMIUM: string;
   PREMIUM_HISTORY_LIMIT: string;
   ADMIN_SECRET: string;
+  STRIPE_SECRET_KEY: string;
+  STRIPE_WEBHOOK_SECRET: string;
+  STRIPE_PRICE_ID: string;
+  STRIPE_SUCCESS_URL: string;
+  STRIPE_CANCEL_URL: string;
   DB: D1Database;
 };
 
@@ -108,6 +115,38 @@ app.post('/webhook', async (c) => {
 
   // 2. 立即回應 LINE，避免超時
   return c.json({ status: 'success' });
+});
+
+// Stripe webhook：付款完成後核發付費額度（client_reference_id 帶的是 LINE userId）
+app.post('/webhook/stripe', async (c) => {
+  const signature = c.req.header('stripe-signature') || '';
+  const body = await c.req.text();
+
+  const stripe = getStripeClient(c);
+
+  let event: Stripe.Event;
+  try {
+    event = await stripe.webhooks.constructEventAsync(
+      body,
+      signature,
+      c.env.STRIPE_WEBHOOK_SECRET,
+      undefined,
+      Stripe.createSubtleCryptoProvider()
+    );
+  } catch (err) {
+    console.error('Stripe webhook signature verification failed:', err);
+    return c.text('Invalid signature', 400);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object as Stripe.Checkout.Session;
+    const userId = session.client_reference_id;
+    if (userId) {
+      c.executionCtx.waitUntil(handleStripeCheckoutCompleted(c, event.id, userId));
+    }
+  }
+
+  return c.json({ received: true });
 });
 
 // handleMessage 回傳 null 代表已由內部處理（onboarding 多訊息推播），不需外層再 push
@@ -255,15 +294,7 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
 
   // 付費牆快速回覆按鈕的回應處理
   if (text === '讓你記得我') {
-    return [
-      '【付費方案】',
-      '・1500 則對話額度，無使用期限',
-      '・深度情緒感知與長期記憶',
-      '・四種人設（沉、言、夜、嶼）任意切換',
-      '・每日主動問候',
-      '',
-      '付款功能即將上線，敬請期待！'
-    ].join('\n');
+    return buildUpgradeMessage(c, user);
   }
 
   if (text === '下次再說') {
@@ -296,15 +327,7 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
   }
 
   if (text === '升級' || text === '付費' || text === '付費方案') {
-    return [
-      '【付費方案】',
-      '・1500 則對話額度，無使用期限',
-      '・深度情緒感知與長期記憶',
-      '・四種人設（沉、言、夜、嶼）任意切換',
-      '・每日主動問候',
-      '',
-      '付款功能即將上線，敬請期待！'
-    ].join('\n');
+    return buildUpgradeMessage(c, user);
   }
 
   // 管理員手動升級（金流上線前的暫時方案）：「/admin upgrade <ADMIN_SECRET>」
@@ -350,6 +373,64 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
   }
 
   return null;
+}
+
+// Stripe client（Cloudflare Workers 需用 fetch-based httpClient，無法用 Node 預設的 http/https）
+function getStripeClient(c: any): Stripe {
+  return new Stripe(c.env.STRIPE_SECRET_KEY, {
+    httpClient: Stripe.createFetchHttpClient()
+  });
+}
+
+// 建立 Stripe Checkout Session 付款連結；client_reference_id 帶 LINE userId，供 webhook 核對身分
+async function createStripeCheckoutUrl(userId: string, c: any): Promise<string | null> {
+  try {
+    const stripe = getStripeClient(c);
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: [{ price: c.env.STRIPE_PRICE_ID, quantity: 1 }],
+      client_reference_id: userId,
+      success_url: c.env.STRIPE_SUCCESS_URL,
+      cancel_url: c.env.STRIPE_CANCEL_URL
+    });
+    return session.url;
+  } catch (e) {
+    console.error('Stripe checkout session creation failed:', e);
+    return null;
+  }
+}
+
+// 付費方案說明 + Stripe 付款連結
+async function buildUpgradeMessage(c: any, user: UserState): Promise<string> {
+  const intro = [
+    '【付費方案】',
+    '・1500 則對話額度，無使用期限',
+    '・深度情緒感知與長期記憶',
+    '・四種人設（沉、言、夜、嶼）任意切換',
+    '・每日主動問候',
+    ''
+  ].join('\n');
+
+  const checkoutUrl = await createStripeCheckoutUrl(user.line_user_id, c);
+  if (!checkoutUrl) {
+    return `${intro}付款功能暫時無法使用，請稍後再試 🙏`;
+  }
+  return `${intro}點此完成付款：\n${checkoutUrl}`;
+}
+
+// Stripe 付款完成後核發付費額度並通知使用者（以 event.id 去重，避免 Stripe 重送事件造成重複派發）
+async function handleStripeCheckoutCompleted(c: any, eventId: string, userId: string): Promise<void> {
+  const db = c.env.DB as D1Database;
+  const isFirstTime = await markStripeEventProcessed(db, eventId);
+  if (!isFirstTime) return;
+
+  await getOrCreateUser(db, userId);
+  await upgradeToPremium(db, userId);
+  await pushMessageToLine(
+    userId,
+    '付款完成，已升級為付費方案，獲得 1500 則對話額度！輸入「人設」可切換喜歡的人設 💛',
+    c
+  ).catch((e) => console.error('Stripe upgrade confirmation push failed:', userId, e));
 }
 
 // 單次 Together AI 請求（一律串流，相容「只支援串流」的模型）。
