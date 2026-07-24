@@ -27,18 +27,18 @@
 			"database_name": "my-line-bot-db",
 			"database_id": "804c53b2-3aea-4222-9ee5-77da7c217cc6"
 		}
-	]
+	],
 	// Stripe 金流串接所需環境變數：
-	// - vars（非機密，可直接填在這裡）：
+	// - vars（非機密，直接填在這裡）：
 	//     STRIPE_PAYMENT_LINK  Stripe Dashboard 建立的 Payment Link
-	//                          （例：https://buy.stripe.com/xxxxxxxxxxxx，正式上線前記得換成 live 模式的連結）
+	//                          （目前是 test 模式連結，正式上線前記得換成 live 模式的連結）
 	// - secrets（機密，用 `wrangler secret put <NAME>` 設定，不要寫進這個檔案）：
 	//     STRIPE_SECRET_KEY     Stripe API 密鑰（sk_live_... / sk_test_...）
 	//     STRIPE_WEBHOOK_SECRET Stripe webhook 簽章密鑰（whsec_...），
 	//                            對應 Stripe Dashboard 設定的 endpoint：/webhook/stripe
-	// "vars": {
-	//   "STRIPE_PAYMENT_LINK": "https://buy.stripe.com/xxxxxxxxxxxx"
-	// },
+	"vars": {
+		"STRIPE_PAYMENT_LINK": "https://buy.stripe.com/test_aFacN47ftfak7Hq4pu3Je00"
+	},
 	// "kv_namespaces": [
 	//   {
 	//     "binding": "MY_KV_NAMESPACE",
