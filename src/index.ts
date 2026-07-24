@@ -324,7 +324,8 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
     return `已切換為「${getPersona(personaId).label}」，從現在開始用這個樣子陪你聊天 😊`;
   }
 
-  if (text === '升級' || text === '付費' || text === '付費方案') {
+  // 「立即購買」是圖文選單按鈕送出的固定文字（OA Manager 無 Postback 選項，只能用文字類型動作）
+  if (text === '升級' || text === '付費' || text === '付費方案' || text === '立即購買') {
     return buildUpgradeMessage(c, user);
   }
 
