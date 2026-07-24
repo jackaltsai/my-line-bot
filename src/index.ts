@@ -43,9 +43,7 @@ type Bindings = {
   ADMIN_SECRET: string;
   STRIPE_SECRET_KEY: string;
   STRIPE_WEBHOOK_SECRET: string;
-  STRIPE_PRICE_ID: string;
-  STRIPE_SUCCESS_URL: string;
-  STRIPE_CANCEL_URL: string;
+  STRIPE_PAYMENT_LINK: string;
   DB: D1Database;
 };
 
@@ -335,7 +333,7 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
     const secret = text.slice('/admin upgrade '.length).trim();
     if (c.env.ADMIN_SECRET && secret === c.env.ADMIN_SECRET) {
       await upgradeToPremium(db, user.line_user_id);
-      return '已升級為付費方案，獲得 1500 則對話額度！輸入「人設」可切換喜歡的人設 💛';
+      return '已升級為付費方案，獲得 500 則對話額度！輸入「人設」可切換喜歡的人設 💛';
     }
     return null;
   }
@@ -382,39 +380,28 @@ function getStripeClient(c: any): Stripe {
   });
 }
 
-// 建立 Stripe Checkout Session 付款連結；client_reference_id 帶 LINE userId，供 webhook 核對身分
-async function createStripeCheckoutUrl(userId: string, c: any): Promise<string | null> {
-  try {
-    const stripe = getStripeClient(c);
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      line_items: [{ price: c.env.STRIPE_PRICE_ID, quantity: 1 }],
-      client_reference_id: userId,
-      success_url: c.env.STRIPE_SUCCESS_URL,
-      cancel_url: c.env.STRIPE_CANCEL_URL
-    });
-    return session.url;
-  } catch (e) {
-    console.error('Stripe checkout session creation failed:', e);
-    return null;
-  }
+// 在 Stripe Payment Link 上附加 client_reference_id，讓 webhook 能核對回是哪個 LINE 使用者付款
+function buildStripeCheckoutUrl(paymentLink: string, userId: string): string {
+  const url = new URL(paymentLink);
+  url.searchParams.set('client_reference_id', userId);
+  return url.toString();
 }
 
 // 付費方案說明 + Stripe 付款連結
 async function buildUpgradeMessage(c: any, user: UserState): Promise<string> {
   const intro = [
     '【付費方案】',
-    '・1500 則對話額度，無使用期限',
+    '・500 則對話額度，無使用期限',
     '・深度情緒感知與長期記憶',
     '・四種人設（沉、言、夜、嶼）任意切換',
     '・每日主動問候',
     ''
   ].join('\n');
 
-  const checkoutUrl = await createStripeCheckoutUrl(user.line_user_id, c);
-  if (!checkoutUrl) {
+  if (!c.env.STRIPE_PAYMENT_LINK) {
     return `${intro}付款功能暫時無法使用，請稍後再試 🙏`;
   }
+  const checkoutUrl = buildStripeCheckoutUrl(c.env.STRIPE_PAYMENT_LINK, user.line_user_id);
   return `${intro}點此完成付款：\n${checkoutUrl}`;
 }
 
@@ -428,7 +415,7 @@ async function handleStripeCheckoutCompleted(c: any, eventId: string, userId: st
   await upgradeToPremium(db, userId);
   await pushMessageToLine(
     userId,
-    '付款完成，已升級為付費方案，獲得 1500 則對話額度！輸入「人設」可切換喜歡的人設 💛',
+    '付款完成，已升級為付費方案，獲得 500 則對話額度！輸入「人設」可切換喜歡的人設 💛',
     c
   ).catch((e) => console.error('Stripe upgrade confirmation push failed:', userId, e));
 }

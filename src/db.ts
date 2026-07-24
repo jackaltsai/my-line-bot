@@ -1,7 +1,7 @@
 import type { PersonaId } from './personas';
 
 export const FREE_DAILY_LIMIT = 10;
-export const PREMIUM_CREDITS_GRANT = 1500;
+export const PREMIUM_CREDITS_GRANT = 500;
 
 export interface UserState {
   line_user_id: string;
