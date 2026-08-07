@@ -136,10 +136,19 @@ export async function setPersona(db: D1Database, lineUserId: string, persona: Pe
     .run();
 }
 
-// 升級為付費方案並核發對話額度
+// 升級為付費方案並核發對話額度（訂閱首期扣款成功時呼叫）
 export async function upgradeToPremium(db: D1Database, lineUserId: string, credits = PREMIUM_CREDITS_GRANT): Promise<void> {
   await db
     .prepare(`UPDATE users SET plan = 'premium', premium_credits = premium_credits + ?,
+              updated_at = datetime('now') WHERE line_user_id = ?`)
+    .bind(credits, lineUserId)
+    .run();
+}
+
+// 訂閱每期扣款成功時呼叫：把額度重置為當期核發量（而非累加），對應「每月 500 則」的訂閱額度
+export async function resetPremiumCredits(db: D1Database, lineUserId: string, credits = PREMIUM_CREDITS_GRANT): Promise<void> {
+  await db
+    .prepare(`UPDATE users SET plan = 'premium', premium_credits = ?,
               updated_at = datetime('now') WHERE line_user_id = ?`)
     .bind(credits, lineUserId)
     .run();
@@ -326,7 +335,7 @@ export async function saveInvoiceInfo(
     .run();
 }
 
-// 建立 OEN 交易的待處理紀錄；在轉址付款頁前先寫入，讓 webhook 進來時能對應回是哪個 LINE 使用者
+// 建立 OEN 訂閱首期交易的待處理紀錄；在轉址付款頁前先寫入，讓 webhook 進來時能對應回是哪個 LINE 使用者
 export async function createPendingOenTransaction(
   db: D1Database,
   params: { transactionId: string; orderId: string; lineUserId: string; amount: number }
@@ -338,6 +347,32 @@ export async function createPendingOenTransaction(
     )
     .bind(params.transactionId, params.orderId, params.lineUserId, params.amount)
     .run();
+}
+
+// 依 order_id 回查建立訂閱時登記的 line_user_id；訂閱後續每期扣款會有全新的 transaction_id，
+// 但共用建立訂閱當下的 order_id，藉此在拿不到 customId 時仍能對應回使用者
+export async function getOenLineUserIdByOrderId(db: D1Database, orderId: string): Promise<string | null> {
+  const row = await db
+    .prepare('SELECT line_user_id FROM oen_transactions WHERE order_id = ? LIMIT 1')
+    .bind(orderId)
+    .first<{ line_user_id: string }>();
+  return row?.line_user_id ?? null;
+}
+
+// 原子登記一筆訂閱續期扣款結果；transaction_id 是 PRIMARY KEY，INSERT OR IGNORE 讓
+// webhook 重送時不會重複核發額度。回傳是否為本次呼叫真正寫入（true 才需要核發/通知）
+export async function recordOenRenewalCharge(
+  db: D1Database,
+  params: { transactionId: string; orderId: string; lineUserId: string; amount: number; status: 'charged' | 'failed' }
+): Promise<boolean> {
+  const result = await db
+    .prepare(
+      `INSERT OR IGNORE INTO oen_transactions (transaction_id, order_id, line_user_id, amount, status)
+       VALUES (?, ?, ?, ?, ?)`
+    )
+    .bind(params.transactionId, params.orderId, params.lineUserId, params.amount, params.status)
+    .run();
+  return (result.meta.changes ?? 0) > 0;
 }
 
 export interface OenTransactionRow {

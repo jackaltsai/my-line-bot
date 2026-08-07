@@ -7,6 +7,7 @@ import {
   createPendingOenTransaction,
   downgradeToFree,
   finalizeOenTransaction,
+  getOenLineUserIdByOrderId,
   getOenTransaction,
   getOrCreateUser,
   getPremiumUsers,
@@ -18,6 +19,8 @@ import {
   incrementTotalTurns,
   logUsage,
   markPaywallTriggered,
+  recordOenRenewalCharge,
+  resetPremiumCredits,
   saveInvoiceInfo,
   saveMessage,
   saveOnboardingAnswer,
@@ -53,7 +56,7 @@ type Bindings = {
   DB: D1Database;
 };
 
-const PREMIUM_PLAN_AMOUNT = 299; // NT$，500 則對話額度
+const PREMIUM_PLAN_AMOUNT = 299; // NT$/月，訂閱制，每期 500 則對話額度
 
 const app = new Hono<{ Bindings: Bindings }>();
 
@@ -204,7 +207,7 @@ async function processNormalMessage(c: any, user: UserState, text: string): Prom
 
   if (!hasQuota(user)) {
     return user.plan === 'premium'
-      ? '你的對話額度已經用完囉，感謝你一直以來的陪伴 🥹 期待未來能再續約繼續聊天～'
+      ? '這個月的對話額度已經用完囉，下次扣款後會自動補滿 500 則，謝謝你一直以來的陪伴 🥹'
       : `今天的免費額度（${FREE_DAILY_LIMIT} 則）已經用完了，明天再來找我聊天吧！想要更多對話次數、長期記憶與更多人設，可以輸入「升級」了解付費方案 💛`;
   }
 
@@ -313,7 +316,7 @@ async function handlePurchaseIntake(c: any, user: UserState, text: string): Prom
     await saveInvoiceInfo(db, userId, 'invoice_email', email);
     await updatePurchaseIntakeStep(db, userId, 0);
 
-    const checkoutUrl = await createOenCheckout(c, { ...user, invoice_email: email });
+    const checkoutUrl = await createOenSubscriptionCheckout(c, { ...user, invoice_email: email });
     if (!checkoutUrl) {
       await pushMessageToLine(userId, '資料收到了，但產生付款連結時發生問題，麻煩稍後再輸入一次「立即購買」🙏', c);
       return;
@@ -340,7 +343,7 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
   if (text === '狀態' || text === '我的方案') {
     const persona = getPersona(user.persona);
     if (user.plan === 'premium') {
-      return `【付費方案】\n人設：${persona.label}\n剩餘對話額度：${user.premium_credits} 則（無使用期限）\n輸入「人設」可查看可切換的人設`;
+      return `【付費方案】\n人設：${persona.label}\n本期剩餘對話額度：${user.premium_credits} 則（每月扣款自動補滿 500 則）\n輸入「人設」可查看可切換的人設`;
     }
     return `【免費方案】\n人設：${persona.label}\n今日剩餘對話次數：${Math.max(0, FREE_DAILY_LIMIT - user.message_count_today)} / ${FREE_DAILY_LIMIT}\n輸入「升級」了解付費方案`;
   }
@@ -372,7 +375,7 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
     const secret = text.slice('/admin upgrade '.length).trim();
     if (c.env.ADMIN_SECRET && secret === c.env.ADMIN_SECRET) {
       await upgradeToPremium(db, user.line_user_id);
-      return '已升級為付費方案，獲得 500 則對話額度！輸入「人設」可切換喜歡的人設 💛';
+      return '已升級為付費方案，獲得本期 500 則對話額度！輸入「人設」可切換喜歡的人設 💛';
     }
     return null;
   }
@@ -412,15 +415,16 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
   return null;
 }
 
-// 建立 OEN 全跳轉單次交易，回傳付款頁網址；失敗回傳 null。
-// 建立成功後立刻把 transactionId ↔ line_user_id 的對應寫入 D1，供 webhook 核對回是誰付款。
-async function createOenCheckout(c: any, user: UserState): Promise<string | null> {
+// 建立 OEN 全跳轉訂閱交易（每月自動扣款，未帶 numberOfPeriods 代表無限期直到取消），回傳付款頁網址；失敗回傳 null。
+// 建立成功後立刻把 transactionId/orderId ↔ line_user_id 的對應寫入 D1，
+// 供 webhook 核對「首期扣款」回是誰付款；後續每期續扣會沿用同一個 orderId，見 handleOenWebhook。
+async function createOenSubscriptionCheckout(c: any, user: UserState): Promise<string | null> {
   const db = c.env.DB as D1Database;
-  const orderId = `hc-${user.line_user_id.slice(-8)}-${Date.now()}`;
+  const orderId = `hc-sub-${user.line_user_id.slice(-8)}-${Date.now()}`;
 
   let res: Response;
   try {
-    res = await fetch(`${c.env.OEN_API_BASE_URL}/checkout`, {
+    res = await fetch(`${c.env.OEN_API_BASE_URL}/checkout-subscription`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -435,9 +439,10 @@ async function createOenCheckout(c: any, user: UserState): Promise<string | null
         failureUrl: c.env.OEN_FAILURE_URL,
         userName: user.invoice_name,
         userEmail: user.invoice_email,
+        customId: user.line_user_id,
         productDetails: [{
-          productionCode: 'premium_500',
-          description: '心辰付費方案 500 則對話額度',
+          productionCode: 'premium_500_monthly',
+          description: '心辰付費方案 每月 500 則對話額度（訂閱制）',
           quantity: 1,
           unit: '份',
           unitPrice: PREMIUM_PLAN_AMOUNT
@@ -445,19 +450,19 @@ async function createOenCheckout(c: any, user: UserState): Promise<string | null
       })
     });
   } catch (e) {
-    console.error('OEN checkout request exception:', e);
+    console.error('OEN checkout-subscription request exception:', e);
     return null;
   }
 
   if (!res.ok) {
-    console.error('OEN checkout error:', res.status, await res.text());
+    console.error('OEN checkout-subscription error:', res.status, await res.text());
     return null;
   }
 
   const body: any = await res.json();
   const transactionId: string | undefined = body?.data?.id;
   if (!transactionId) {
-    console.error('OEN checkout response missing data.id:', JSON.stringify(body));
+    console.error('OEN checkout-subscription response missing data.id:', JSON.stringify(body));
     return null;
   }
 
@@ -468,7 +473,7 @@ async function createOenCheckout(c: any, user: UserState): Promise<string | null
     amount: PREMIUM_PLAN_AMOUNT
   });
 
-  return `${c.env.OEN_CHECKOUT_BASE_URL}/checkout/${transactionId}`;
+  return `${c.env.OEN_CHECKOUT_BASE_URL}/checkout/subscription/${transactionId}`;
 }
 
 // 付費方案說明 + 付款連結；發票用姓名/email 沒收集過的話，先啟動蒐集狀態機
@@ -481,15 +486,15 @@ async function buildUpgradeMessage(c: any, user: UserState): Promise<string> {
   }
 
   const intro = [
-    '【付費方案】',
-    '・500 則對話額度，無使用期限',
+    '【付費方案】NT$299 / 月，訂閱制自動續訂',
+    '・每月 500 則對話額度',
     '・深度情緒感知與長期記憶',
     '・四種人設（沉、言、夜、嶼）任意切換',
     '・每日主動問候',
     ''
   ].join('\n');
 
-  const checkoutUrl = await createOenCheckout(c, user);
+  const checkoutUrl = await createOenSubscriptionCheckout(c, user);
   if (!checkoutUrl) {
     return `${intro}付款功能暫時無法使用，請稍後再試 🙏`;
   }
@@ -497,15 +502,14 @@ async function buildUpgradeMessage(c: any, user: UserState): Promise<string> {
 }
 
 // OEN 付款結果 webhook 處理：不直接信任 payload，反查 GET /transactions/{id} 取得真實狀態，
-// 再用 D1 的 pending → charged/failed 原子轉換去重，避免 webhook 重送重複核發額度
+// 再用 D1 做去重，避免 webhook 重送重複核發額度。
+// 分兩種情境：
+// 1. 已知交易（訂閱首期扣款，建立付款連結時就用 createPendingOenTransaction 寫入過）
+//    → pending → charged/failed 原子轉換去重
+// 2. 未知交易（訂閱後續每期扣款，transaction_id 是全新的）
+//    → 用 customId 或（回查 order_id）找到 line_user_id，直接 INSERT OR IGNORE 去重
 async function handleOenWebhook(c: any, transactionId: string): Promise<void> {
   const db = c.env.DB as D1Database;
-
-  const txRow = await getOenTransaction(db, transactionId);
-  if (!txRow) {
-    console.error('OEN webhook: unknown transaction id', transactionId);
-    return;
-  }
 
   let res: Response;
   try {
@@ -523,21 +527,63 @@ async function handleOenWebhook(c: any, transactionId: string): Promise<void> {
 
   const body: any = await res.json();
   const status: string | undefined = body?.data?.status;
+  if (status !== 'charged' && status !== 'failed') return; // initiated/charging 等下一次 webhook
 
-  if (status === 'charged') {
-    const finalized = await finalizeOenTransaction(db, transactionId, 'charged');
+  const known = await getOenTransaction(db, transactionId);
+  if (known) {
+    const finalized = await finalizeOenTransaction(db, transactionId, status);
     if (!finalized) return; // 已處理過，避免重複核發
 
-    await upgradeToPremium(db, txRow.line_user_id);
-    await pushMessageToLine(
-      txRow.line_user_id,
-      '付款完成，已升級為付費方案，獲得 500 則對話額度！輸入「人設」可切換喜歡的人設 💛',
-      c
-    ).catch((e) => console.error('OEN upgrade confirmation push failed:', txRow.line_user_id, e));
-  } else if (status === 'failed') {
-    await finalizeOenTransaction(db, transactionId, 'failed');
+    if (status === 'charged') {
+      await upgradeToPremium(db, known.line_user_id);
+      await pushMessageToLine(
+        known.line_user_id,
+        '付款完成，已開始每月訂閱，獲得本期 500 則對話額度！輸入「人設」可切換喜歡的人設 💛',
+        c
+      ).catch((e) => console.error('OEN subscription confirmation push failed:', known.line_user_id, e));
+    } else {
+      await pushMessageToLine(
+        known.line_user_id,
+        '付款沒有成功，麻煩確認付款方式後再試一次，或輸入「升級」重新產生付款連結 🙏',
+        c
+      ).catch((e) => console.error('OEN subscription failure push failed:', known.line_user_id, e));
+    }
+    return;
   }
-  // 其他狀態（initiated/charging）不處理，等下一次 webhook
+
+  // 未知交易 ID：訂閱後續每期扣款。回查是哪個使用者：優先用 customId，沒有的話用 orderId 查建立訂閱時的紀錄
+  const orderId: string | undefined = body?.data?.orderId;
+  const customId: string | undefined = body?.data?.customId;
+  const lineUserId = customId || (orderId ? await getOenLineUserIdByOrderId(db, orderId) : null);
+  if (!lineUserId) {
+    console.error('OEN webhook: cannot correlate renewal transaction to a user', { transactionId, orderId, customId, status });
+    return;
+  }
+
+  const recorded = await recordOenRenewalCharge(db, {
+    transactionId,
+    orderId: orderId || `renewal-${transactionId}`,
+    lineUserId,
+    amount: body?.data?.amount || PREMIUM_PLAN_AMOUNT,
+    status
+  });
+  if (!recorded) return; // 已處理過（webhook 重送）
+
+  if (status === 'charged') {
+    await resetPremiumCredits(db, lineUserId);
+    await pushMessageToLine(
+      lineUserId,
+      '本期訂閱扣款成功，額度已補滿 500 則！輸入「狀態」可查看剩餘額度 💛',
+      c
+    ).catch((e) => console.error('OEN renewal confirmation push failed:', lineUserId, e));
+  } else {
+    console.error('OEN subscription renewal charge failed', { transactionId, lineUserId });
+    await pushMessageToLine(
+      lineUserId,
+      '這期的訂閱扣款沒有成功，麻煩確認一下付款方式，或聯繫我們協助處理 🙏',
+      c
+    ).catch((e) => console.error('OEN renewal failure push failed:', lineUserId, e));
+  }
 }
 
 // 單次 Together AI 請求（一律串流，相容「只支援串流」的模型）。
