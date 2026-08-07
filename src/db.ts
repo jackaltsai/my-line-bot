@@ -23,6 +23,8 @@ export interface UserState {
   purchase_intake_step: number; // 0=none 1=等待姓名 2=等待email（OEN 開發票用）
   invoice_name: string;
   invoice_email: string;
+  oen_subscription_id: string;      // OEN 定期定額 ID，取消訂閱時要用
+  subscription_cancelled_at: string; // 空字串=訂閱中；非空=已取消（本期用完後不再扣款）
   /** 暫態欄位（不存在 DB）：此次 getOrCreateUser 是否為首次建立 */
   is_new?: boolean;
 }
@@ -74,6 +76,8 @@ export async function getOrCreateUser(db: D1Database, lineUserId: string): Promi
       purchase_intake_step: 0,
       invoice_name: '',
       invoice_email: '',
+      oen_subscription_id: '',
+      subscription_cancelled_at: '',
       is_new: true
     };
   }
@@ -373,6 +377,25 @@ export async function recordOenRenewalCharge(
     .bind(params.transactionId, params.orderId, params.lineUserId, params.amount, params.status)
     .run();
   return (result.meta.changes ?? 0) > 0;
+}
+
+// 訂閱首期扣款確認成功時呼叫：記錄 OEN 定期定額 ID（取消訂閱時要用），
+// 並清空取消時間戳記（若使用者取消後重新訂閱，等同開了一筆全新的訂閱）
+export async function saveOenSubscriptionId(db: D1Database, lineUserId: string, subscriptionId: string): Promise<void> {
+  await db
+    .prepare(`UPDATE users SET oen_subscription_id = ?, subscription_cancelled_at = '',
+              updated_at = datetime('now') WHERE line_user_id = ?`)
+    .bind(subscriptionId, lineUserId)
+    .run();
+}
+
+// 標記訂閱已取消（本期額度用完後就不會再扣款）；用量不變，僅記錄取消時間
+export async function markSubscriptionCancelled(db: D1Database, lineUserId: string): Promise<void> {
+  await db
+    .prepare(`UPDATE users SET subscription_cancelled_at = datetime('now'),
+              updated_at = datetime('now') WHERE line_user_id = ?`)
+    .bind(lineUserId)
+    .run();
 }
 
 export interface OenTransactionRow {

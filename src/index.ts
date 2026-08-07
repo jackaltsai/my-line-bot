@@ -19,10 +19,12 @@ import {
   incrementTotalTurns,
   logUsage,
   markPaywallTriggered,
+  markSubscriptionCancelled,
   recordOenRenewalCharge,
   resetPremiumCredits,
   saveInvoiceInfo,
   saveMessage,
+  saveOenSubscriptionId,
   saveOnboardingAnswer,
   setPersona,
   updateLastActive,
@@ -100,7 +102,8 @@ app.post('/webhook', async (c) => {
 
         try {
           const reply = await handleMessage(c, userId, text);
-          if (reply !== null) {
+          // reply === '' 代表已由內部（例如取消訂閱的二次確認）直接推播過，不用再送一次
+          if (reply) {
             await pushMessageToLine(userId, reply, c);
           }
         } catch (err) {
@@ -343,7 +346,10 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
   if (text === '狀態' || text === '我的方案') {
     const persona = getPersona(user.persona);
     if (user.plan === 'premium') {
-      return `【付費方案】\n人設：${persona.label}\n本期剩餘對話額度：${user.premium_credits} 則（每月扣款自動補滿 500 則）\n輸入「人設」可查看可切換的人設`;
+      const subLine = user.subscription_cancelled_at
+        ? '（訂閱已取消，這期用完後不會再扣款）'
+        : '（每月扣款自動補滿 500 則）';
+      return `【付費方案】\n人設：${persona.label}\n本期剩餘對話額度：${user.premium_credits} 則${subLine}\n輸入「人設」可查看可切換的人設\n輸入「取消訂閱」可隨時取消`;
     }
     return `【免費方案】\n人設：${persona.label}\n今日剩餘對話次數：${Math.max(0, FREE_DAILY_LIMIT - user.message_count_today)} / ${FREE_DAILY_LIMIT}\n輸入「升級」了解付費方案`;
   }
@@ -368,6 +374,42 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
   // 「立即購買」是圖文選單按鈕送出的固定文字（OA Manager 無 Postback 選項，只能用文字類型動作）
   if (text === '升級' || text === '付費' || text === '付費方案' || text === '立即購買') {
     return buildUpgradeMessage(c, user);
+  }
+
+  // 取消訂閱：先二次確認，避免誤觸
+  if (text === '取消訂閱' || text === '取消付費') {
+    if (user.plan !== 'premium') {
+      return '你目前是免費方案，沒有進行中的訂閱可以取消喔。';
+    }
+    if (user.subscription_cancelled_at) {
+      return `你的訂閱已經是取消狀態，這期剩餘的 ${user.premium_credits} 則用完後就不會再扣款了。`;
+    }
+    await pushQuickReplyToLine(
+      user.line_user_id,
+      `確定要取消訂閱嗎？取消後這期剩餘的 ${user.premium_credits} 則額度還是可以繼續用，只是不會再每月自動扣款。`,
+      ['確定取消訂閱', '先不取消'],
+      c
+    );
+    return '';
+  }
+
+  if (text === '確定取消訂閱') {
+    if (user.plan !== 'premium' || user.subscription_cancelled_at) {
+      return null; // 不在有效的取消流程中，當一般訊息交給 AI 處理
+    }
+    if (!user.oen_subscription_id) {
+      return '找不到你的訂閱資訊，麻煩直接聯繫我們協助處理 🙏';
+    }
+    const cancelled = await cancelOenSubscription(c, user);
+    if (!cancelled) {
+      return '取消訂閱時發生問題，麻煩稍後再試一次，或聯繫我們協助處理 🙏';
+    }
+    await markSubscriptionCancelled(db, user.line_user_id);
+    return `已經幫你取消訂閱了。這期剩餘的 ${user.premium_credits} 則額度還是可以繼續使用，用完後就不會再扣款囉。`;
+  }
+
+  if (text === '先不取消') {
+    return '好，那我們維持現狀 😊';
   }
 
   // 管理員手動升級（金流上線前的暫時方案）：「/admin upgrade <ADMIN_SECRET>」
@@ -476,6 +518,34 @@ async function createOenSubscriptionCheckout(c: any, user: UserState): Promise<s
   return `${c.env.OEN_CHECKOUT_BASE_URL}/checkout/subscription/${transactionId}`;
 }
 
+// 呼叫 OEN 取消定期定額 API，成功回傳 true
+async function cancelOenSubscription(c: any, user: UserState): Promise<boolean> {
+  let res: Response;
+  try {
+    res = await fetch(`${c.env.OEN_API_BASE_URL}/subscriptions/${user.oen_subscription_id}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${c.env.OEN_API_TOKEN}`
+      },
+      body: JSON.stringify({
+        merchantId: c.env.OEN_MERCHANT_ID,
+        reason: '使用者於 LINE 主動取消訂閱'
+      })
+    });
+  } catch (e) {
+    console.error('OEN cancel subscription request exception:', e);
+    return false;
+  }
+
+  if (!res.ok) {
+    console.error('OEN cancel subscription error:', res.status, await res.text());
+    return false;
+  }
+
+  return true;
+}
+
 // 付費方案說明 + 付款連結；發票用姓名/email 沒收集過的話，先啟動蒐集狀態機
 async function buildUpgradeMessage(c: any, user: UserState): Promise<string> {
   const db = c.env.DB as D1Database;
@@ -491,6 +561,7 @@ async function buildUpgradeMessage(c: any, user: UserState): Promise<string> {
     '・深度情緒感知與長期記憶',
     '・四種人設（沉、言、夜、嶼）任意切換',
     '・每日主動問候',
+    '・不綁約，隨時可輸入「取消訂閱」取消',
     ''
   ].join('\n');
 
@@ -536,6 +607,15 @@ async function handleOenWebhook(c: any, transactionId: string): Promise<void> {
 
     if (status === 'charged') {
       await upgradeToPremium(db, known.line_user_id);
+
+      // data.id 在 GET /transactions/{id} 回應中是 transaction hid，取消訂閱的 API 要用這個當 subscriptionId
+      const subscriptionId: string | undefined = body?.data?.id;
+      if (subscriptionId) {
+        await saveOenSubscriptionId(db, known.line_user_id, subscriptionId);
+      } else {
+        console.error('OEN webhook: charged transaction missing data.id (subscription id)', transactionId);
+      }
+
       await pushMessageToLine(
         known.line_user_id,
         '付款完成，已開始每月訂閱，獲得本期 500 則對話額度！輸入「人設」可切換喜歡的人設 💛',
