@@ -20,6 +20,9 @@ export interface UserState {
   paywall_triggered: number; // 0|1
   total_turns: number;
   milestones_triggered: string; // JSON array of milestone IDs
+  purchase_intake_step: number; // 0=none 1=等待姓名 2=等待email（OEN 開發票用）
+  invoice_name: string;
+  invoice_email: string;
   /** 暫態欄位（不存在 DB）：此次 getOrCreateUser 是否為首次建立 */
   is_new?: boolean;
 }
@@ -68,6 +71,9 @@ export async function getOrCreateUser(db: D1Database, lineUserId: string): Promi
       paywall_triggered: 0,
       total_turns: 0,
       milestones_triggered: '[]',
+      purchase_intake_step: 0,
+      invoice_name: '',
+      invoice_email: '',
       is_new: true
     };
   }
@@ -299,11 +305,70 @@ export async function logUsage(
     .run();
 }
 
-// 標記 Stripe webhook 事件為已處理；回傳是否為首次處理（INSERT OR IGNORE 確保去重是原子操作）
-export async function markStripeEventProcessed(db: D1Database, eventId: string): Promise<boolean> {
+// 更新購買前發票資訊蒐集的步驟（0=none 1=等待姓名 2=等待email）
+export async function updatePurchaseIntakeStep(db: D1Database, lineUserId: string, step: number): Promise<void> {
+  await db
+    .prepare(`UPDATE users SET purchase_intake_step = ?, updated_at = datetime('now') WHERE line_user_id = ?`)
+    .bind(step, lineUserId)
+    .run();
+}
+
+// 儲存發票用的姓名/email
+export async function saveInvoiceInfo(
+  db: D1Database,
+  lineUserId: string,
+  field: 'invoice_name' | 'invoice_email',
+  value: string
+): Promise<void> {
+  await db
+    .prepare(`UPDATE users SET ${field} = ?, updated_at = datetime('now') WHERE line_user_id = ?`)
+    .bind(value, lineUserId)
+    .run();
+}
+
+// 建立 OEN 交易的待處理紀錄；在轉址付款頁前先寫入，讓 webhook 進來時能對應回是哪個 LINE 使用者
+export async function createPendingOenTransaction(
+  db: D1Database,
+  params: { transactionId: string; orderId: string; lineUserId: string; amount: number }
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO oen_transactions (transaction_id, order_id, line_user_id, amount, status)
+       VALUES (?, ?, ?, ?, 'pending')`
+    )
+    .bind(params.transactionId, params.orderId, params.lineUserId, params.amount)
+    .run();
+}
+
+export interface OenTransactionRow {
+  transaction_id: string;
+  order_id: string;
+  line_user_id: string;
+  amount: number;
+  status: 'pending' | 'charged' | 'failed';
+}
+
+export async function getOenTransaction(db: D1Database, transactionId: string): Promise<OenTransactionRow | null> {
+  const row = await db
+    .prepare('SELECT * FROM oen_transactions WHERE transaction_id = ?')
+    .bind(transactionId)
+    .first<OenTransactionRow>();
+  return row ?? null;
+}
+
+// 把交易從 pending 轉成終態；WHERE status = 'pending' 確保這是原子操作，
+// 回傳是否為本次呼叫真正完成轉換（避免 webhook 重送時重複核發額度）
+export async function finalizeOenTransaction(
+  db: D1Database,
+  transactionId: string,
+  status: 'charged' | 'failed'
+): Promise<boolean> {
   const result = await db
-    .prepare('INSERT OR IGNORE INTO stripe_events (event_id) VALUES (?)')
-    .bind(eventId)
+    .prepare(
+      `UPDATE oen_transactions SET status = ?, updated_at = datetime('now')
+       WHERE transaction_id = ? AND status = 'pending'`
+    )
+    .bind(status, transactionId)
     .run();
   return (result.meta.changes ?? 0) > 0;
 }

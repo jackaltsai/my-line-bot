@@ -1,11 +1,13 @@
 import { Hono } from 'hono';
 import { validateSignature } from '@line/bot-sdk';
-import Stripe from 'stripe';
 import {
   FREE_DAILY_LIMIT,
   addMilestoneTrigger,
   consumeQuota,
+  createPendingOenTransaction,
   downgradeToFree,
+  finalizeOenTransaction,
+  getOenTransaction,
   getOrCreateUser,
   getPremiumUsers,
   getRecentMessages,
@@ -16,12 +18,13 @@ import {
   incrementTotalTurns,
   logUsage,
   markPaywallTriggered,
-  markStripeEventProcessed,
+  saveInvoiceInfo,
   saveMessage,
   saveOnboardingAnswer,
   setPersona,
   updateLastActive,
   updateOnboardingStep,
+  updatePurchaseIntakeStep,
   updateSilenceStage,
   upgradeToPremium,
   type UserState
@@ -41,11 +44,16 @@ type Bindings = {
   TOGETHER_MODEL_PREMIUM: string;
   PREMIUM_HISTORY_LIMIT: string;
   ADMIN_SECRET: string;
-  STRIPE_SECRET_KEY: string;
-  STRIPE_WEBHOOK_SECRET: string;
-  STRIPE_PAYMENT_LINK: string;
+  OEN_API_BASE_URL: string;
+  OEN_CHECKOUT_BASE_URL: string;
+  OEN_MERCHANT_ID: string;
+  OEN_API_TOKEN: string;
+  OEN_SUCCESS_URL: string;
+  OEN_FAILURE_URL: string;
   DB: D1Database;
 };
+
+const PREMIUM_PLAN_AMOUNT = 299; // NT$，500 則對話額度
 
 const app = new Hono<{ Bindings: Bindings }>();
 
@@ -115,35 +123,25 @@ app.post('/webhook', async (c) => {
   return c.json({ status: 'success' });
 });
 
-// Stripe webhook：付款完成後核發付費額度（client_reference_id 帶的是 LINE userId）
-app.post('/webhook/stripe', async (c) => {
-  const signature = c.req.header('stripe-signature') || '';
+// OEN webhook：付款結果通知。文件未載明簽章驗證欄位，保險起見不直接信任 payload，
+// 收到通知後用自己的 Bearer token 反查 GET /transactions/{id} 取得真實狀態再處理。
+app.post('/webhook/oen', async (c) => {
   const body = await c.req.text();
 
-  const stripe = getStripeClient(c);
-
-  let event: Stripe.Event;
+  let payload: any;
   try {
-    event = await stripe.webhooks.constructEventAsync(
-      body,
-      signature,
-      c.env.STRIPE_WEBHOOK_SECRET,
-      undefined,
-      Stripe.createSubtleCryptoProvider()
-    );
-  } catch (err) {
-    console.error('Stripe webhook signature verification failed:', err);
-    return c.text('Invalid signature', 400);
+    payload = JSON.parse(body);
+  } catch {
+    return c.text('Bad Request', 400);
   }
 
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object as Stripe.Checkout.Session;
-    const userId = session.client_reference_id;
-    if (userId) {
-      c.executionCtx.waitUntil(handleStripeCheckoutCompleted(c, event.id, userId));
-    }
+  const transactionId: string | undefined = payload?.id;
+  if (!transactionId) {
+    // 沒有可辨識的交易 ID，沒辦法處理；直接回 200 避免 OEN 一直重送
+    return c.json({ received: true });
   }
 
+  c.executionCtx.waitUntil(handleOenWebhook(c, transactionId));
   return c.json({ received: true });
 });
 
@@ -164,6 +162,12 @@ async function handleMessage(c: any, userId: string, text: string): Promise<stri
   // Onboarding 未完成時，交由狀態機處理
   if (user.onboarding_step < 4) {
     await handleOnboarding(c, user, text);
+    return null;
+  }
+
+  // 購買前發票資訊蒐集（姓名/email）未完成時，交由狀態機處理
+  if (user.purchase_intake_step > 0) {
+    await handlePurchaseIntake(c, user, text);
     return null;
   }
 
@@ -285,6 +289,40 @@ async function handleOnboarding(c: any, user: UserState, text: string): Promise<
   }
 }
 
+// 購買前發票資訊蒐集狀態機：OEN 開發票需要姓名與 email，只在第一次購買時問，之後重複使用
+// step 1: 等待姓名 → 存 invoice_name，問 email
+// step 2: 等待 email → 存 invoice_email，產生 OEN 付款連結並推播
+async function handlePurchaseIntake(c: any, user: UserState, text: string): Promise<void> {
+  const db = c.env.DB as D1Database;
+  const userId = user.line_user_id;
+
+  if (user.purchase_intake_step === 1) {
+    const name = text.slice(0, 50);
+    await saveInvoiceInfo(db, userId, 'invoice_name', name);
+    await updatePurchaseIntakeStep(db, userId, 2);
+    await pushMessageToLine(userId, '謝謝。再麻煩提供 Email，用來寄送電子發票：', c);
+    return;
+  }
+
+  if (user.purchase_intake_step === 2) {
+    const email = text.trim();
+    if (!email.includes('@')) {
+      await pushMessageToLine(userId, 'Email 格式看起來不太對，麻煩再輸入一次：', c);
+      return;
+    }
+    await saveInvoiceInfo(db, userId, 'invoice_email', email);
+    await updatePurchaseIntakeStep(db, userId, 0);
+
+    const checkoutUrl = await createOenCheckout(c, { ...user, invoice_email: email });
+    if (!checkoutUrl) {
+      await pushMessageToLine(userId, '資料收到了，但產生付款連結時發生問題，麻煩稍後再輸入一次「立即購買」🙏', c);
+      return;
+    }
+    await pushMessageToLine(userId, `謝謝，資料都收到了！點此完成付款：\n${checkoutUrl}`, c);
+    return;
+  }
+}
+
 // 處理特殊指令（狀態查詢、人設切換、升級資訊、管理員手動升級）
 // 回傳 null 代表非指令，應走一般 AI 對話流程
 async function handleCommand(c: any, user: UserState, text: string): Promise<string | null> {
@@ -374,22 +412,74 @@ async function handleCommand(c: any, user: UserState, text: string): Promise<str
   return null;
 }
 
-// Stripe client（Cloudflare Workers 需用 fetch-based httpClient，無法用 Node 預設的 http/https）
-function getStripeClient(c: any): Stripe {
-  return new Stripe(c.env.STRIPE_SECRET_KEY, {
-    httpClient: Stripe.createFetchHttpClient()
+// 建立 OEN 全跳轉單次交易，回傳付款頁網址；失敗回傳 null。
+// 建立成功後立刻把 transactionId ↔ line_user_id 的對應寫入 D1，供 webhook 核對回是誰付款。
+async function createOenCheckout(c: any, user: UserState): Promise<string | null> {
+  const db = c.env.DB as D1Database;
+  const orderId = `hc-${user.line_user_id.slice(-8)}-${Date.now()}`;
+
+  let res: Response;
+  try {
+    res = await fetch(`${c.env.OEN_API_BASE_URL}/checkout`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${c.env.OEN_API_TOKEN}`
+      },
+      body: JSON.stringify({
+        merchantId: c.env.OEN_MERCHANT_ID,
+        amount: PREMIUM_PLAN_AMOUNT,
+        currency: 'TWD',
+        orderId,
+        successUrl: c.env.OEN_SUCCESS_URL,
+        failureUrl: c.env.OEN_FAILURE_URL,
+        userName: user.invoice_name,
+        userEmail: user.invoice_email,
+        productDetails: [{
+          productionCode: 'premium_500',
+          description: '心辰付費方案 500 則對話額度',
+          quantity: 1,
+          unit: '份',
+          unitPrice: PREMIUM_PLAN_AMOUNT
+        }]
+      })
+    });
+  } catch (e) {
+    console.error('OEN checkout request exception:', e);
+    return null;
+  }
+
+  if (!res.ok) {
+    console.error('OEN checkout error:', res.status, await res.text());
+    return null;
+  }
+
+  const body: any = await res.json();
+  const transactionId: string | undefined = body?.data?.id;
+  if (!transactionId) {
+    console.error('OEN checkout response missing data.id:', JSON.stringify(body));
+    return null;
+  }
+
+  await createPendingOenTransaction(db, {
+    transactionId,
+    orderId,
+    lineUserId: user.line_user_id,
+    amount: PREMIUM_PLAN_AMOUNT
   });
+
+  return `${c.env.OEN_CHECKOUT_BASE_URL}/checkout/${transactionId}`;
 }
 
-// 在 Stripe Payment Link 上附加 client_reference_id，讓 webhook 能核對回是哪個 LINE 使用者付款
-function buildStripeCheckoutUrl(paymentLink: string, userId: string): string {
-  const url = new URL(paymentLink);
-  url.searchParams.set('client_reference_id', userId);
-  return url.toString();
-}
-
-// 付費方案說明 + Stripe 付款連結
+// 付費方案說明 + 付款連結；發票用姓名/email 沒收集過的話，先啟動蒐集狀態機
 async function buildUpgradeMessage(c: any, user: UserState): Promise<string> {
+  const db = c.env.DB as D1Database;
+
+  if (!user.invoice_name || !user.invoice_email) {
+    await updatePurchaseIntakeStep(db, user.line_user_id, 1);
+    return '為了幫您開立電子發票，先跟您要一下資料——請問怎麼稱呼您（姓名）？';
+  }
+
   const intro = [
     '【付費方案】',
     '・500 則對話額度，無使用期限',
@@ -399,26 +489,55 @@ async function buildUpgradeMessage(c: any, user: UserState): Promise<string> {
     ''
   ].join('\n');
 
-  if (!c.env.STRIPE_PAYMENT_LINK) {
+  const checkoutUrl = await createOenCheckout(c, user);
+  if (!checkoutUrl) {
     return `${intro}付款功能暫時無法使用，請稍後再試 🙏`;
   }
-  const checkoutUrl = buildStripeCheckoutUrl(c.env.STRIPE_PAYMENT_LINK, user.line_user_id);
   return `${intro}點此完成付款：\n${checkoutUrl}`;
 }
 
-// Stripe 付款完成後核發付費額度並通知使用者（以 event.id 去重，避免 Stripe 重送事件造成重複派發）
-async function handleStripeCheckoutCompleted(c: any, eventId: string, userId: string): Promise<void> {
+// OEN 付款結果 webhook 處理：不直接信任 payload，反查 GET /transactions/{id} 取得真實狀態，
+// 再用 D1 的 pending → charged/failed 原子轉換去重，避免 webhook 重送重複核發額度
+async function handleOenWebhook(c: any, transactionId: string): Promise<void> {
   const db = c.env.DB as D1Database;
-  const isFirstTime = await markStripeEventProcessed(db, eventId);
-  if (!isFirstTime) return;
 
-  await getOrCreateUser(db, userId);
-  await upgradeToPremium(db, userId);
-  await pushMessageToLine(
-    userId,
-    '付款完成，已升級為付費方案，獲得 500 則對話額度！輸入「人設」可切換喜歡的人設 💛',
-    c
-  ).catch((e) => console.error('Stripe upgrade confirmation push failed:', userId, e));
+  const txRow = await getOenTransaction(db, transactionId);
+  if (!txRow) {
+    console.error('OEN webhook: unknown transaction id', transactionId);
+    return;
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`${c.env.OEN_API_BASE_URL}/transactions/${transactionId}`, {
+      headers: { 'Authorization': `Bearer ${c.env.OEN_API_TOKEN}` }
+    });
+  } catch (e) {
+    console.error('OEN transaction verification fetch failed:', e);
+    return;
+  }
+  if (!res.ok) {
+    console.error('OEN transaction verification error:', res.status, await res.text());
+    return;
+  }
+
+  const body: any = await res.json();
+  const status: string | undefined = body?.data?.status;
+
+  if (status === 'charged') {
+    const finalized = await finalizeOenTransaction(db, transactionId, 'charged');
+    if (!finalized) return; // 已處理過，避免重複核發
+
+    await upgradeToPremium(db, txRow.line_user_id);
+    await pushMessageToLine(
+      txRow.line_user_id,
+      '付款完成，已升級為付費方案，獲得 500 則對話額度！輸入「人設」可切換喜歡的人設 💛',
+      c
+    ).catch((e) => console.error('OEN upgrade confirmation push failed:', txRow.line_user_id, e));
+  } else if (status === 'failed') {
+    await finalizeOenTransaction(db, transactionId, 'failed');
+  }
+  // 其他狀態（initiated/charging）不處理，等下一次 webhook
 }
 
 // 單次 Together AI 請求（一律串流，相容「只支援串流」的模型）。
