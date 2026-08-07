@@ -41,6 +41,12 @@
 	//     OEN_API_TOKEN 應援 CRM 後台 - 總設定 - 開發者選項 產出的 Bearer token
 	//                   測試環境的 token 只能在測試環境用，正式環境要另外產一組
 	//                   同一頁記得把「交易回傳位置」設定成 /webhook/oen 的完整網址
+	//     OEN_PROXY_KEY 正式環境專用：OEN 要求正式環境串接要綁定固定 IP，Workers 沒有固定
+	//                   出口 IP，所以正式環境改讓 Worker 打一個有固定 IP 的 Caddy reverse
+	//                   proxy（GCP VM，網域 oen-proxy.heartchen.com），再由它轉發到 OEN。
+	//                   這組值要跟該台 VM 上 /etc/caddy/Caddyfile 裡的 X-Proxy-Key 一致，
+	//                   避免這個 proxy 網址被陌生人拿去亂打 OEN。測試環境直連 OEN、不經過
+	//                   proxy，這個 header 會被 OEN 忽略，設一組任意值即可。
 	"vars": {
 		"OEN_API_BASE_URL": "https://payment-api.testing.oen.tw",
 		"OEN_CHECKOUT_BASE_URL": "https://hata.testing.oen.tw",

@@ -55,6 +55,7 @@ type Bindings = {
   OEN_API_TOKEN: string;
   OEN_SUCCESS_URL: string;
   OEN_FAILURE_URL: string;
+  OEN_PROXY_KEY: string;
   DB: D1Database;
 };
 
@@ -470,7 +471,8 @@ async function createOenSubscriptionCheckout(c: any, user: UserState): Promise<s
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${c.env.OEN_API_TOKEN}`
+        'Authorization': `Bearer ${c.env.OEN_API_TOKEN}`,
+        'X-Proxy-Key': c.env.OEN_PROXY_KEY
       },
       body: JSON.stringify({
         merchantId: c.env.OEN_MERCHANT_ID,
@@ -526,7 +528,8 @@ async function cancelOenSubscription(c: any, user: UserState): Promise<boolean> 
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${c.env.OEN_API_TOKEN}`
+        'Authorization': `Bearer ${c.env.OEN_API_TOKEN}`,
+        'X-Proxy-Key': c.env.OEN_PROXY_KEY
       },
       body: JSON.stringify({
         merchantId: c.env.OEN_MERCHANT_ID,
@@ -585,7 +588,10 @@ async function handleOenWebhook(c: any, transactionId: string): Promise<void> {
   let res: Response;
   try {
     res = await fetch(`${c.env.OEN_API_BASE_URL}/transactions/${transactionId}`, {
-      headers: { 'Authorization': `Bearer ${c.env.OEN_API_TOKEN}` }
+      headers: {
+        'Authorization': `Bearer ${c.env.OEN_API_TOKEN}`,
+        'X-Proxy-Key': c.env.OEN_PROXY_KEY
+      }
     });
   } catch (e) {
     console.error('OEN transaction verification fetch failed:', e);
