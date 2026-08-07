@@ -502,6 +502,9 @@ async function createOenSubscriptionCheckout(c: any, user: UserState): Promise<s
   }
 
   const body: any = await res.json();
+  // 除錯用：文件沒寫清楚定期定額的 subscriptionId 從哪個欄位來，先印出完整回應找欄位
+  console.log('OEN checkout-subscription response:', JSON.stringify(body));
+
   const transactionId: string | undefined = body?.data?.id;
   if (!transactionId) {
     console.error('OEN checkout-subscription response missing data.id:', JSON.stringify(body));
@@ -597,6 +600,9 @@ async function handleOenWebhook(c: any, transactionId: string): Promise<void> {
   }
 
   const body: any = await res.json();
+  // 除錯用：文件沒寫清楚定期定額的 subscriptionId 從哪個欄位來，先印出完整回應找欄位
+  console.log('OEN transaction verification response:', JSON.stringify(body));
+
   const status: string | undefined = body?.data?.status;
   if (status !== 'charged' && status !== 'failed') return; // initiated/charging 等下一次 webhook
 
