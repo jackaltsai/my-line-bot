@@ -502,9 +502,6 @@ async function createOenSubscriptionCheckout(c: any, user: UserState): Promise<s
   }
 
   const body: any = await res.json();
-  // 除錯用：文件沒寫清楚定期定額的 subscriptionId 從哪個欄位來，先印出完整回應找欄位
-  console.log('OEN checkout-subscription response:', JSON.stringify(body));
-
   const transactionId: string | undefined = body?.data?.id;
   if (!transactionId) {
     console.error('OEN checkout-subscription response missing data.id:', JSON.stringify(body));
@@ -600,9 +597,6 @@ async function handleOenWebhook(c: any, transactionId: string): Promise<void> {
   }
 
   const body: any = await res.json();
-  // 除錯用：文件沒寫清楚定期定額的 subscriptionId 從哪個欄位來，先印出完整回應找欄位
-  console.log('OEN transaction verification response:', JSON.stringify(body));
-
   const status: string | undefined = body?.data?.status;
   if (status !== 'charged' && status !== 'failed') return; // initiated/charging 等下一次 webhook
 
@@ -614,12 +608,13 @@ async function handleOenWebhook(c: any, transactionId: string): Promise<void> {
     if (status === 'charged') {
       await upgradeToPremium(db, known.line_user_id);
 
-      // data.id 在 GET /transactions/{id} 回應中是 transaction hid，取消訂閱的 API 要用這個當 subscriptionId
-      const subscriptionId: string | undefined = body?.data?.id;
+      // GET /transactions/{id} 回應中的 data.subscriptionId 才是取消訂閱要用的定期定額 ID
+      // （跟 data.id / transactionId 是三個完全不同的值，文件的 Attribute 表格沒列出這個欄位）
+      const subscriptionId: string | undefined = body?.data?.subscriptionId;
       if (subscriptionId) {
         await saveOenSubscriptionId(db, known.line_user_id, subscriptionId);
       } else {
-        console.error('OEN webhook: charged transaction missing data.id (subscription id)', transactionId);
+        console.error('OEN webhook: charged transaction missing data.subscriptionId', transactionId);
       }
 
       await pushMessageToLine(
