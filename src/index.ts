@@ -478,7 +478,7 @@ async function callTogetherAI(user: UserState, text: string, c: any): Promise<st
   // 雙模型分級：免費用快速小模型省成本，付費用大模型提升品質
   const primaryModel = user.plan === 'premium'
     ? (c.env.TOGETHER_MODEL_PREMIUM || c.env.TOGETHER_MODEL || 'Qwen/Qwen3.7-Max')
-    : (c.env.TOGETHER_MODEL_FREE || 'Qwen/Qwen2.5-7B-Instruct-Turbo');
+    : (c.env.TOGETHER_MODEL_FREE || 'Qwen/Qwen3.5-9B');
 
   // 備用模型：主模型失敗時 fallback，避免客戶看到錯誤訊息
   const fallbackModel = c.env.TOGETHER_MODEL_FALLBACK || 'meta-llama/Llama-3.3-70B-Instruct-Turbo';
